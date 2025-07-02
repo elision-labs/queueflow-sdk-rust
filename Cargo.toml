@@ -1,0 +1,162 @@
+[package]
+name = "queueflow"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.70"
+authors = ["QueueFlow Team <sdk@queueflow.dev>"]
+license = "MIT"
+description = "Official Rust SDK for QueueFlow - PostgreSQL-native workflow and job processing"
+homepage = "https://queueflow.dev"
+repository = "https://github.com/queueflow/rust-sdk"
+documentation = "https://docs.rs/queueflow"
+readme = "README.md"
+keywords = ["workflow", "jobs", "queue", "postgresql", "async"]
+categories = ["asynchronous", "database", "web-programming"]
+
+[dependencies]
+# HTTP client with performance optimizations
+reqwest = { version = "0.11", default-features = false, features = [
+    "json",
+    "gzip",
+    "brotli",
+    "stream",
+    "rustls-tls"  # Use rustls for better performance
+] }
+
+# Async runtime
+tokio = { version = "1.35", features = ["macros", "rt-multi-thread", "time", "sync"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error handling
+thiserror = "1.0"
+
+# Date/time handling
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL handling
+url = "2.5"
+urlencoding = "2.1"
+
+# UUID generation
+uuid = { version = "1.6", features = ["v4", "serde"] }
+
+# Retry logic
+backoff = { version = "0.4", features = ["tokio"] }
+
+# Logging and tracing
+tracing = { version = "0.1", features = ["log"] }
+
+# Performance optimizations
+parking_lot = "0.12"  # Faster mutex implementation
+ahash = "0.8"  # Faster hasher
+smallvec = "1.11"  # Small vector optimization
+
+[dev-dependencies]
+# Testing
+tokio-test = "0.4"
+wiremock = "0.6"
+pretty_assertions = "1.4"
+proptest = "1.4"  # Property-based testing
+test-case = "3.3"  # Parameterized tests
+
+# Benchmarking
+criterion = { version = "0.5", features = ["html_reports", "async_tokio"] }
+pprof = { version = "0.13", features = ["flamegraph", "criterion"] }
+
+# Code coverage
+tarpaulin = "0.27"
+
+[features]
+default = ["rustls-tls"]
+
+# TLS features
+native-tls = ["reqwest/native-tls"]
+rustls-tls = ["reqwest/rustls-tls"]
+
+# Performance features
+performance = ["mimalloc"]
+
+# Development features
+dev = ["mock", "test-utils"]
+mock = []
+test-utils = []
+
+[dependencies.mimalloc]
+version = "0.1"
+optional = true
+
+[profile.release]
+opt-level = 3
+lto = "fat"  # Full LTO for maximum optimization
+codegen-units = 1
+panic = "abort"
+strip = true  # Strip symbols for smaller binary
+debug = false
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true
+strip = false
+
+[profile.bench]
+inherits = "release"
+debug = true
+
+[profile.dev]
+opt-level = 0
+debug = true
+incremental = true
+
+[profile.test]
+opt-level = 2  # Optimize tests for faster execution
+debug = true
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs"
+
+[[example]]
+name = "workflow_example"
+path = "examples/workflow_example.rs"
+
+[[example]]
+name = "batch_jobs"
+path = "examples/batch_jobs.rs"
+
+[[example]]
+name = "error_handling"
+path = "examples/error_handling.rs"
+
+[[example]]
+name = "performance"
+path = "examples/performance.rs"
+
+[[bench]]
+name = "client_benchmark"
+harness = false
+
+[[bench]]
+name = "serialization_benchmark"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+nursery = "warn"
+cargo = "warn"
+# Allow some pedantic lints
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
