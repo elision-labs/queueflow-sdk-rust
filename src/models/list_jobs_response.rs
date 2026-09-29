@@ -19,6 +19,9 @@ pub struct ListJobsResponse {
     pub jobs: Vec<models::Job>,
     #[serde(rename = "limit")]
     pub limit: i64,
+    /// Opaque keyset cursor for the next page (present when `has_more`). Pass it back as `cursor` to continue where this page ended; cheaper than deep OFFSET paging.
+    #[serde(rename = "next_cursor", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Option<String>>,
     #[serde(rename = "offset")]
     pub offset: i64,
     /// Exact total match count. Only present when the request set `include_total=true`; computing it costs a full count over the filtered set, so it is opt-in.
@@ -32,6 +35,7 @@ impl ListJobsResponse {
             has_more,
             jobs,
             limit,
+            next_cursor: None,
             offset,
             total: None,
         }

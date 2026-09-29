@@ -165,7 +165,7 @@ pub async fn get_cron(configuration: &configuration::Configuration, id: &str) ->
     }
 }
 
-pub async fn list_crons(configuration: &configuration::Configuration, status: Option<&str>, queue: Option<&str>, limit: Option<i64>, offset: Option<i64>, order_by: Option<&str>, include_total: Option<bool>) -> Result<models::ListCronsResponse, Error<ListCronsError>> {
+pub async fn list_crons(configuration: &configuration::Configuration, status: Option<&str>, queue: Option<&str>, limit: Option<i64>, offset: Option<i64>, order_by: Option<&str>, include_total: Option<bool>, cursor: Option<&str>) -> Result<models::ListCronsResponse, Error<ListCronsError>> {
     let local_var_configuration = configuration;
 
     let local_var_client = &local_var_configuration.client;
@@ -190,6 +190,9 @@ pub async fn list_crons(configuration: &configuration::Configuration, status: Op
     }
     if let Some(ref local_var_str) = include_total {
         local_var_req_builder = local_var_req_builder.query(&[("include_total", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_str) = cursor {
+        local_var_req_builder = local_var_req_builder.query(&[("cursor", &local_var_str.to_string())]);
     }
     if let Some(ref local_var_user_agent) = local_var_configuration.user_agent {
         local_var_req_builder = local_var_req_builder.header(reqwest::header::USER_AGENT, local_var_user_agent.clone());

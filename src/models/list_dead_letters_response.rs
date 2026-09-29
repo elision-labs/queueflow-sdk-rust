@@ -19,6 +19,9 @@ pub struct ListDeadLettersResponse {
     pub has_more: bool,
     #[serde(rename = "limit")]
     pub limit: i64,
+    /// Opaque keyset cursor for the next page (present when `has_more`). Pass it back as `cursor` to continue where this page ended; cheaper than deep OFFSET paging.
+    #[serde(rename = "next_cursor", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<Option<String>>,
     #[serde(rename = "offset")]
     pub offset: i64,
     /// Exact total match count; only present when `include_total=true`.
@@ -32,6 +35,7 @@ impl ListDeadLettersResponse {
             dead_letters,
             has_more,
             limit,
+            next_cursor: None,
             offset,
             total: None,
         }

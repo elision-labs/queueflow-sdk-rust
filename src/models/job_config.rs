@@ -11,38 +11,38 @@
 use crate::models;
 use serde::{Deserialize, Serialize};
 
-/// JobConfig : Per-job execution configuration. All durations are in seconds.
+/// JobConfig : Per-job execution configuration. All durations are in seconds.  Deserialization is partial-friendly: any omitted field takes its [`JobConfig::default`] value (via per-field serde defaults), so workflow-step and cron config overrides can name just the fields they change, and out-of-band rows with sparse `config` JSONB still load. Per-field functions rather than a struct-level `#[serde(default)]`: the struct-level form makes utoipa attach a `default` beside the `BackoffStrategy` `$ref`, which forces a synthetic wrapper type into every generated SDK.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobConfig {
     /// Optional jitter in `0.0..=1.0`. `0.1` => +/-10% randomization of each retry delay, which spreads out thundering-herd retries.
     #[serde(rename = "jitter_factor", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
     pub jitter_factor: Option<Option<f64>>,
-    #[serde(rename = "max_retries")]
-    pub max_retries: i32,
+    #[serde(rename = "max_retries", skip_serializing_if = "Option::is_none")]
+    pub max_retries: Option<i32>,
     /// Higher is claimed first within a queue; ties break on `scheduled_at`, then `created_at`.
-    #[serde(rename = "priority")]
-    pub priority: i32,
+    #[serde(rename = "priority", skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
     #[serde(rename = "retry_backoff", skip_serializing_if = "Option::is_none")]
     pub retry_backoff: Option<models::BackoffStrategy>,
-    #[serde(rename = "retry_delay_secs")]
-    pub retry_delay_secs: i64,
-    #[serde(rename = "retry_max_delay_secs")]
-    pub retry_max_delay_secs: i64,
-    #[serde(rename = "timeout_secs")]
-    pub timeout_secs: i64,
+    #[serde(rename = "retry_delay_secs", skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<i64>,
+    #[serde(rename = "retry_max_delay_secs", skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_secs: Option<i64>,
+    #[serde(rename = "timeout_secs", skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<i64>,
 }
 
 impl JobConfig {
-    /// Per-job execution configuration. All durations are in seconds.
-    pub fn new(max_retries: i32, priority: i32, retry_delay_secs: i64, retry_max_delay_secs: i64, timeout_secs: i64) -> JobConfig {
+    /// Per-job execution configuration. All durations are in seconds.  Deserialization is partial-friendly: any omitted field takes its [`JobConfig::default`] value (via per-field serde defaults), so workflow-step and cron config overrides can name just the fields they change, and out-of-band rows with sparse `config` JSONB still load. Per-field functions rather than a struct-level `#[serde(default)]`: the struct-level form makes utoipa attach a `default` beside the `BackoffStrategy` `$ref`, which forces a synthetic wrapper type into every generated SDK.
+    pub fn new() -> JobConfig {
         JobConfig {
             jitter_factor: None,
-            max_retries,
-            priority,
+            max_retries: None,
+            priority: None,
             retry_backoff: None,
-            retry_delay_secs,
-            retry_max_delay_secs,
-            timeout_secs,
+            retry_delay_secs: None,
+            retry_max_delay_secs: None,
+            timeout_secs: None,
         }
     }
 }

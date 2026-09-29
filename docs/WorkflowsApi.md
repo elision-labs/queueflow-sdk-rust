@@ -126,7 +126,7 @@ Name | Type | Description  | Required | Notes
 
 ## list_workflows
 
-> models::ListWorkflowsResponse list_workflows(status, queue, limit, offset, order_by, include_total)
+> models::ListWorkflowsResponse list_workflows(status, queue, limit, offset, order_by, include_total, cursor)
 
 
 ### Parameters
@@ -140,6 +140,7 @@ Name | Type | Description  | Required | Notes
 **offset** | Option<**i64**> | Number of records to skip (default 0). |  |
 **order_by** | Option<**String**> | `created_at ASC` or `created_at DESC` (default DESC). |  |
 **include_total** | Option<**bool**> | Include the exact `total` count in the response (default false; the count is an extra full scan over the filtered set). |  |
+**cursor** | Option<**String**> | Opaque keyset cursor from a previous page's `next_cursor`. When set, `offset` is ignored and listing continues where that page ended. |  |
 
 ### Return type
 

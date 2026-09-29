@@ -239,3 +239,29 @@ async fn wait_for_workflow_treats_partially_failed_as_terminal() {
         queueflow::models::WorkflowStatus::PartiallyFailed
     );
 }
+
+#[tokio::test]
+async fn create_cron_sends_name_and_expression_in_the_right_fields() {
+    // Regression: name and cron_expr are both strings and were once swapped
+    // by the positional constructor, sending the human name as the
+    // expression (which the server rejects as invalid cron syntax).
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/cron"))
+        .and(wiremock::matchers::body_partial_json(json!({
+            "name": "nightly-report",
+            "cron_expr": "0 3 * * *",
+            "task_name": "report"
+        })))
+        .respond_with(ResponseTemplate::new(201).set_body_json(json!({ "cron_id": "c1" })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "tok");
+    let id = qf
+        .create_cron("nightly-report", "0 3 * * *", "report")
+        .await
+        .expect("create_cron should succeed with correctly-mapped fields");
+    assert_eq!(id, "c1");
+}

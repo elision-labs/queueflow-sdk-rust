@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 /// JobConfigRequest : Optional per-job configuration overrides.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct JobConfigRequest {
+    /// Retry-delay jitter in `0.0..=1.0` (e.g. `0.1` = +/-10%).
+    #[serde(rename = "jitter_factor", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub jitter_factor: Option<Option<f64>>,
     #[serde(rename = "max_retries", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
     pub max_retries: Option<Option<i32>>,
     /// Higher is claimed first within a queue (ties: oldest first).
@@ -22,6 +25,15 @@ pub struct JobConfigRequest {
     /// Override the destination queue.
     #[serde(rename = "queue", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
     pub queue: Option<Option<String>>,
+    /// How retry delays grow between attempts (default exponential).
+    #[serde(rename = "retry_backoff", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub retry_backoff: Option<Option<models::BackoffStrategy>>,
+    /// Base retry delay, in seconds.
+    #[serde(rename = "retry_delay_secs", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub retry_delay_secs: Option<Option<i64>>,
+    /// Upper bound on any computed retry delay, in seconds.
+    #[serde(rename = "retry_max_delay_secs", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
+    pub retry_max_delay_secs: Option<Option<i64>>,
     /// Per-attempt timeout, in seconds.
     #[serde(rename = "timeout", default, with = "::serde_with::rust::double_option", skip_serializing_if = "Option::is_none")]
     pub timeout: Option<Option<i64>>,
@@ -31,9 +43,13 @@ impl JobConfigRequest {
     /// Optional per-job configuration overrides.
     pub fn new() -> JobConfigRequest {
         JobConfigRequest {
+            jitter_factor: None,
             max_retries: None,
             priority: None,
             queue: None,
+            retry_backoff: None,
+            retry_delay_secs: None,
+            retry_max_delay_secs: None,
             timeout: None,
         }
     }
