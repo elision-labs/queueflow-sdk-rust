@@ -8,6 +8,7 @@ Method | HTTP request | Description
 [**create_workflow**](WorkflowsApi.md#create_workflow) | **POST** /api/v1/workflows | 
 [**get_workflow**](WorkflowsApi.md#get_workflow) | **GET** /api/v1/workflows/{id} | 
 [**get_workflow_diagram**](WorkflowsApi.md#get_workflow_diagram) | **GET** /api/v1/workflows/{id}/diagram | 
+[**get_workflow_step_states**](WorkflowsApi.md#get_workflow_step_states) | **GET** /api/v1/workflows/{id}/steps | 
 [**list_workflows**](WorkflowsApi.md#list_workflows) | **GET** /api/v1/workflows | 
 
 
@@ -111,6 +112,34 @@ Name | Type | Description  | Required | Notes
 ### Return type
 
 [**models::WorkflowDiagramResponse**](WorkflowDiagramResponse.md)
+
+### Authorization
+
+[bearerAuth](../README.md#bearerAuth)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## get_workflow_step_states
+
+> models::WorkflowStepStatesResponse get_workflow_step_states(id)
+
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**id** | **String** | Workflow id | [required] |
+
+### Return type
+
+[**models::WorkflowStepStatesResponse**](WorkflowStepStatesResponse.md)
 
 ### Authorization
 

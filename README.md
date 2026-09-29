@@ -54,6 +54,7 @@ Class | Method | HTTP request | Description
 *WorkflowsApi* | [**create_workflow**](docs/WorkflowsApi.md#create_workflow) | **POST** /api/v1/workflows | 
 *WorkflowsApi* | [**get_workflow**](docs/WorkflowsApi.md#get_workflow) | **GET** /api/v1/workflows/{id} | 
 *WorkflowsApi* | [**get_workflow_diagram**](docs/WorkflowsApi.md#get_workflow_diagram) | **GET** /api/v1/workflows/{id}/diagram | 
+*WorkflowsApi* | [**get_workflow_step_states**](docs/WorkflowsApi.md#get_workflow_step_states) | **GET** /api/v1/workflows/{id}/steps | 
 *WorkflowsApi* | [**list_workflows**](docs/WorkflowsApi.md#list_workflows) | **GET** /api/v1/workflows | 
 
 
@@ -92,11 +93,14 @@ Class | Method | HTTP request | Description
  - [ReadyStatus](docs/ReadyStatus.md)
  - [ReplayDeadLetterResponse](docs/ReplayDeadLetterResponse.md)
  - [StatsSnapshot](docs/StatsSnapshot.md)
+ - [StepStatus](docs/StepStatus.md)
  - [TasksResponse](docs/TasksResponse.md)
  - [Workflow](docs/Workflow.md)
  - [WorkflowDiagramResponse](docs/WorkflowDiagramResponse.md)
  - [WorkflowStatus](docs/WorkflowStatus.md)
  - [WorkflowStep](docs/WorkflowStep.md)
+ - [WorkflowStepState](docs/WorkflowStepState.md)
+ - [WorkflowStepStatesResponse](docs/WorkflowStepStatesResponse.md)
 
 
 To get access to the crate's generated documentation, use:
