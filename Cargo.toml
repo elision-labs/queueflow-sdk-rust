@@ -1,11 +1,11 @@
 [package]
-name = "queueflow"
+name = "queueflow-sdk"
 version = "0.1.0"
 authors = ["QueueFlow"]
 description = "REST API for QueueFlow, a PostgreSQL-native distributed job queue and workflow engine."
 license = "MIT"
 edition = "2021"
-repository = "https://github.com/queue-flow/sdk-rust"
+repository = "https://github.com/elision-labs/queueflow-sdk-rust"
 homepage = "https://queueflow.dev"
 
 [dependencies]

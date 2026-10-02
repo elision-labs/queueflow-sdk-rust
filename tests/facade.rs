@@ -11,7 +11,7 @@ local wiremock server, so nothing here needs a live QueueFlow.
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use queueflow::{FacadeError, QueueFlow, WorkflowBuilder};
+use queueflow_sdk::{FacadeError, QueueFlow, WorkflowBuilder};
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
@@ -150,7 +150,7 @@ async fn wait_for_job_polls_until_a_terminal_status() {
         .wait_for_job("j1", Duration::from_secs(5), Duration::from_millis(10))
         .await
         .expect("wait_for_job");
-    assert_eq!(job.status, queueflow::models::JobStatus::Completed);
+    assert_eq!(job.status, queueflow_sdk::models::JobStatus::Completed);
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn wait_for_job_returns_failed_rather_than_waiting_it_out() {
         .wait_for_job("j1", Duration::from_secs(5), Duration::from_secs(5))
         .await
         .expect("failed is terminal");
-    assert_eq!(job.status, queueflow::models::JobStatus::Failed);
+    assert_eq!(job.status, queueflow_sdk::models::JobStatus::Failed);
 }
 
 #[tokio::test]
@@ -236,7 +236,7 @@ async fn wait_for_workflow_treats_partially_failed_as_terminal() {
         .expect("partially_failed is terminal");
     assert_eq!(
         wf.status,
-        queueflow::models::WorkflowStatus::PartiallyFailed
+        queueflow_sdk::models::WorkflowStatus::PartiallyFailed
     );
 }
 
