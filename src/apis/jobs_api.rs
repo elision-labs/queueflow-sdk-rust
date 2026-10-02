@@ -196,7 +196,7 @@ pub async fn get_job(configuration: &configuration::Configuration, id: &str) -> 
     }
 }
 
-pub async fn list_jobs(configuration: &configuration::Configuration, status: Option<&str>, queue: Option<&str>, limit: Option<i64>, offset: Option<i64>, order_by: Option<&str>, include_total: Option<bool>, cursor: Option<&str>) -> Result<models::ListJobsResponse, Error<ListJobsError>> {
+pub async fn list_jobs(configuration: &configuration::Configuration, status: Option<&str>, queue: Option<&str>, limit: Option<i64>, offset: Option<i64>, order_by: Option<&str>, include_total: Option<bool>, cursor: Option<&str>, created_after: Option<String>, created_before: Option<String>) -> Result<models::ListJobsResponse, Error<ListJobsError>> {
     let local_var_configuration = configuration;
 
     let local_var_client = &local_var_configuration.client;
@@ -224,6 +224,12 @@ pub async fn list_jobs(configuration: &configuration::Configuration, status: Opt
     }
     if let Some(ref local_var_str) = cursor {
         local_var_req_builder = local_var_req_builder.query(&[("cursor", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_str) = created_after {
+        local_var_req_builder = local_var_req_builder.query(&[("created_after", &local_var_str.to_string())]);
+    }
+    if let Some(ref local_var_str) = created_before {
+        local_var_req_builder = local_var_req_builder.query(&[("created_before", &local_var_str.to_string())]);
     }
     if let Some(ref local_var_user_agent) = local_var_configuration.user_agent {
         local_var_req_builder = local_var_req_builder.header(reqwest::header::USER_AGENT, local_var_user_agent.clone());

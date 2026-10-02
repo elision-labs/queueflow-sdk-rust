@@ -155,7 +155,7 @@ Name | Type | Description  | Required | Notes
 
 ## list_workflows
 
-> models::ListWorkflowsResponse list_workflows(status, queue, limit, offset, order_by, include_total, cursor)
+> models::ListWorkflowsResponse list_workflows(status, queue, limit, offset, order_by, include_total, cursor, created_after, created_before)
 
 
 ### Parameters
@@ -170,6 +170,8 @@ Name | Type | Description  | Required | Notes
 **order_by** | Option<**String**> | `created_at ASC` or `created_at DESC` (default DESC). |  |
 **include_total** | Option<**bool**> | Include the exact `total` count in the response (default false; the count is an extra full scan over the filtered set). |  |
 **cursor** | Option<**String**> | Opaque keyset cursor from a previous page's `next_cursor`. When set, `offset` is ignored and listing continues where that page ended. |  |
+**created_after** | Option<**String**> | Only rows created at or after this instant (RFC 3339, inclusive). With `created_before` this forms the half-open range `[after, before)` — the natural shape for walking history period by period. |  |
+**created_before** | Option<**String**> | Only rows created strictly before this instant (RFC 3339, exclusive). |  |
 
 ### Return type
 
