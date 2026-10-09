@@ -1,18 +1,22 @@
 name: Release
 
-# Publish the crate to crates.io when a v* tag is pushed. Requires the
-# CARGO_REGISTRY_TOKEN repository secret (a crates.io token scoped to
-# publish-update for queueflow-sdk).
+# Publish the crate to crates.io when a v* tag is pushed.
+#
+# Auth is crates.io Trusted Publishing: this repo and workflow are registered
+# as a trusted publisher for queueflow-sdk on crates.io. The id-token
+# permission lets rust-lang/crates-io-auth-action exchange GitHub's OIDC
+# token for a short-lived publish token; no long-lived secret is used.
 on:
   push:
     tags: ["v*"]
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
-    name: cargo publish
+    name: cargo publish (trusted publishing)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,9 +25,9 @@ jobs:
         run: |
           v="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
           [ "v${v}" = "${GITHUB_REF_NAME}" ] || { echo "::error::tag ${GITHUB_REF_NAME} != Cargo.toml version ${v}" >&2; exit 1; }
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
       - name: Publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: |
-          [ -n "${CARGO_REGISTRY_TOKEN}" ] || { echo "::error::CARGO_REGISTRY_TOKEN secret is not set" >&2; exit 1; }
-          cargo publish --allow-dirty
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --allow-dirty
