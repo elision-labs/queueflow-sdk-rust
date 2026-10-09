@@ -1,6 +1,6 @@
 [package]
 name = "queueflow-sdk"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["QueueFlow"]
 description = "REST API for QueueFlow, a PostgreSQL-native distributed job queue and workflow engine."
 license = "MIT"
