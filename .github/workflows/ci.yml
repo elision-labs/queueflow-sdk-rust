@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: Rust stable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # No `cargo fmt --check`: the generated core is not rustfmt-clean and is
+      # regenerated verbatim from the spec. Clippy runs without -D warnings for
+      # the same reason (the generated code carries a handful of lints).
+      - run: cargo clippy --all-targets
+      # Offline tests only: tests/live.rs skips itself without QUEUEFLOW_URL
+      # and is driven from the queueflow-core repo's CI.
+      - run: cargo test

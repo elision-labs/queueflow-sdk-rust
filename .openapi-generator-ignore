@@ -21,3 +21,16 @@
 #docs/*.md
 # Then explicitly reverse the ignore rule for a single file:
 #!docs/README.md
+
+# QueueFlow: hand-written files the generator must never overwrite.
+# NOTE: scripts/generate-sdks.sh in queueflow-core wipes this repo before
+# generating, so these entries only help when the generator runs in place;
+# the wipe itself must also preserve them (see that script's handwritten_for).
+README.md
+LICENSE
+FACADE.md
+.github/**
+.travis.yml
+git_push.sh
+tests/facade.rs
+tests/live.rs
