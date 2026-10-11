@@ -1,9 +1,5 @@
 .gitignore
-.openapi-generator-ignore
-.travis.yml
 Cargo.toml
-FACADE.md
-README.md
 docs/BackoffStrategy.md
 docs/CompleteJobRequest.md
 docs/CreateBatchJobsRequest.md
@@ -38,6 +34,8 @@ docs/ListJobsResponse.md
 docs/ListWorkflowsResponse.md
 docs/OnFailure.md
 docs/OnSuccess.md
+docs/QueueStats.md
+docs/QueuesResponse.md
 docs/ReadyStatus.md
 docs/ReplayDeadLetterResponse.md
 docs/StatsSnapshot.md
@@ -52,7 +50,6 @@ docs/WorkflowStep.md
 docs/WorkflowStepState.md
 docs/WorkflowStepStatesResponse.md
 docs/WorkflowsApi.md
-git_push.sh
 src/apis/configuration.rs
 src/apis/cron_api.rs
 src/apis/dlq_api.rs
@@ -95,6 +92,8 @@ src/models/list_workflows_response.rs
 src/models/mod.rs
 src/models/on_failure.rs
 src/models/on_success.rs
+src/models/queue_stats.rs
+src/models/queues_response.rs
 src/models/ready_status.rs
 src/models/replay_dead_letter_response.rs
 src/models/stats_snapshot.rs

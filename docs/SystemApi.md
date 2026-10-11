@@ -5,6 +5,7 @@ All URIs are relative to *http://localhost:8000*
 Method | HTTP request | Description
 ------------- | ------------- | -------------
 [**get_stats**](SystemApi.md#get_stats) | **GET** /api/v1/stats | 
+[**list_queues**](SystemApi.md#list_queues) | **GET** /api/v1/queues | 
 [**list_tasks**](SystemApi.md#list_tasks) | **GET** /api/v1/tasks | 
 
 
@@ -21,6 +22,31 @@ This endpoint does not need any parameter.
 ### Return type
 
 [**models::StatsSnapshot**](StatsSnapshot.md)
+
+### Authorization
+
+[bearerAuth](../README.md#bearerAuth)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## list_queues
+
+> models::QueuesResponse list_queues()
+
+
+### Parameters
+
+This endpoint does not need any parameter.
+
+### Return type
+
+[**models::QueuesResponse**](QueuesResponse.md)
 
 ### Authorization
 

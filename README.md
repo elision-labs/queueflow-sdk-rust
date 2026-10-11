@@ -4,14 +4,14 @@ Rust client for [QueueFlow](https://queueflow.dev), a PostgreSQL-native distribu
 workflow engine.
 
 - **Typed end-to-end**: request/response models mirror the server's OpenAPI 3.1 spec.
-- **Ergonomic**: `QueueFlow::new`, `create_job`, `wait_for_job`/`wait_for_workflow` pollers, and a
-  workflow builder with local DAG validation.
+- **Ergonomic**: one method per endpoint on `QueueFlow`, `wait_for_job`/`wait_for_workflow`
+  pollers, and a workflow builder with local DAG validation.
+- **Worker runtime**: `run_worker` leases jobs, runs your async handlers concurrently, heartbeats
+  them, and reports outcomes, with the server's retry policy and dead-letter queue doing the rest.
+- **Typed errors**: every non-2xx response is a `FacadeError::Http` carrying the status and body.
 - **Async** (tokio + reqwest).
 - **Thin facade over a generated core**: the facade (`src/facade.rs`) adds what codegen cannot;
   the generated `apis::*` functions and `models::*` types stay available for everything else.
-- **No worker runtime**: this crate exposes the worker-protocol endpoints as raw calls only. For a
-  Rust worker, use the first-party [`queueflow-client`](https://github.com/elision-labs/queueflow-core/tree/main/crates/queueflow-client)
-  crate (see [Worker protocol](#worker-protocol)).
 
 The crate is `queueflow-sdk`; the bare `queueflow` crate name belongs to the server and CLI binary.
 
@@ -19,7 +19,7 @@ The crate is `queueflow-sdk`; the bare `queueflow` crate name belongs to the ser
 
 ```toml
 [dependencies]
-queueflow-sdk = "0.2"
+queueflow-sdk = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde_json = "1"
 ```
@@ -28,9 +28,8 @@ serde_json = "1"
 
 ```rust
 use std::collections::HashMap;
-use std::time::Duration;
 
-use queueflow_sdk::{QueueFlow, WorkflowBuilder};
+use queueflow_sdk::{QueueFlow, WaitOptions, WorkflowBuilder};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -38,10 +37,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Enqueue a job and wait for the result.
     let payload = HashMap::from([("hello".to_owned(), serde_json::json!("world"))]);
-    let job = qf.create_job("echo", Some(payload)).await?;
-    let done = qf
-        .wait_for_job(&job.id, Duration::from_secs(60), Duration::from_millis(500))
-        .await?;
+    let id = qf.create_job("echo", Some(payload)).await?;
+    let done = qf.wait_for_job(&id, WaitOptions::default()).await?;
     println!("job {} finished as {} with {:?}", done.id, done.status, done.result);
     // completed, Some({"hello": "world", "echoed": true})
 
@@ -51,10 +48,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .step("extract", "echo", &[])
         .step("transform", "echo", &["extract"])
         .step("load", "echo", &["transform"]);
-    let wf = qf.create_workflow(&dag).await?;
-    let finished = qf
-        .wait_for_workflow(&wf.id, Duration::from_secs(300), Duration::from_secs(1))
-        .await?;
+    let wf_id = qf.create_workflow(&dag).await?;
+    let finished = qf.wait_for_workflow(&wf_id, WaitOptions::default()).await?;
     println!("workflow {} finished as {}", finished.id, finished.status);
     Ok(())
 }
@@ -66,124 +61,225 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Client
 
-`QueueFlow::new(base_url: &str, token: &str) -> QueueFlow` configures the generated client with
-`Authorization: Bearer <token>` and exposes:
+```rust
+use std::time::Duration;
+use queueflow_sdk::{QueueFlow, QueueFlowOptions};
+
+let qf = QueueFlow::new(base_url, token);
+
+// or, with a separate worker token and a custom timeout:
+let qf = QueueFlow::with_options(
+    QueueFlowOptions::new("http://localhost:8000", "dev") // tenant token (required)
+        .worker_token("worker-secret")   // for lease/heartbeat/complete/fail and run_worker
+        .timeout(Duration::from_secs(30)), // per-request HTTP timeout (default 30s)
+)?;
+```
+
+`QueueFlow` is `Clone` (cheap: it wraps two `reqwest::Client`s). The per-request timeout applies
+to every call except the lease long-poll, which is bounded by `wait_secs + 35s` instead.
+
+| Field | Description |
+| --- | --- |
+| `qf.config` | The generated `Configuration` with the tenant token; pass `&qf.config` to any `apis::*` function. |
+| `qf.worker_config` | The generated `Configuration` with the worker token and no client-level timeout. |
+
+`Json` is `HashMap<String, serde_json::Value>`, the type of every payload, result, context and
+metadata.
+
+### Jobs
 
 | Method | Description |
 | --- | --- |
-| `.config` | The generated `apis::configuration::Configuration`; pass `&qf.config` to any `apis::*` function. |
-| `create_job(task: &str, payload: Option<HashMap<String, serde_json::Value>>) -> Result<models::Job, FacadeError>` | Enqueue a job and return the created record. |
-| `wait_for_job(job_id: &str, timeout: Duration, interval: Duration) -> Result<models::Job, FacadeError>` | Poll until `completed` / `failed` / `cancelled`; `FacadeError::Timeout` past the deadline. |
-| `create_workflow(builder: &WorkflowBuilder) -> Result<models::Workflow, FacadeError>` | Validate the DAG locally, create it, return the record. |
-| `wait_for_workflow(workflow_id: &str, timeout: Duration, interval: Duration) -> Result<models::Workflow, FacadeError>` | Poll until a terminal workflow state. |
-| `create_cron(name: &str, schedule: &str, task: &str) -> Result<String, FacadeError>` | Register a recurring enqueue (5-field crontab, UTC); returns the schedule id. |
-| `replay_dead_letter(id: i64) -> Result<models::Job, FacadeError>` | Re-run a dead-lettered job as a fresh job (at most once; a second replay is a 409). |
+| `create_job(task, payload: Option<Json>) -> String` | Enqueue with the server defaults; returns the job id. |
+| `create_job_with_options(task, CreateJobOptions) -> String` | Enqueue with config, idempotency key and `run_at`; returns the job id. |
+| `get_job(id) -> models::Job` | Fetch a job. |
+| `list_jobs(&ListOptions) -> models::ListJobsResponse` | List jobs (`status`, `queue`, `limit`, `offset`, `order_by`, `include_total`, `cursor`, `created_after`, `created_before`). |
+| `cancel_job(id)` | Cancel a job. |
+| `wait_for_job(id, WaitOptions) -> models::Job` | Poll until `completed` / `failed` / `cancelled`. |
+
+`CreateJobOptions` is `{payload, queue, priority, max_retries, timeout_secs, retry_backoff,
+retry_delay_secs, retry_max_delay_secs, jitter_factor, idempotency_key, run_at}`, all `Option`s
+with `Default`; unset fields are not sent, so the server defaults apply. `run_at` is an RFC 3339
+string. The same `idempotency_key` returns the original job id.
+
+`WaitOptions` is `{timeout, interval}` with a `Default` of 60s and 500ms
+(`WaitOptions::with_timeout(d)` keeps the default interval). Past the deadline the call returns
+`FacadeError::Timeout`.
+
+List responses carry `next_cursor` when there are more pages; pass it back as `cursor` for keyset
+pagination (cheaper than deep `offset`).
+
+### Workflows
+
+| Method | Description |
+| --- | --- |
+| `create_workflow(&WorkflowBuilder) -> String` | Validate the DAG locally, create it, return the workflow id. |
+| `get_workflow(id)` / `list_workflows(&ListOptions)` / `cancel_workflow(id)` | Fetch / list / cancel. |
+| `workflow_diagram(id) -> models::WorkflowDiagramResponse` | Mermaid (`graph TD`) diagram of the DAG. |
+| `workflow_steps(id) -> Vec<models::WorkflowStepState>` | Runtime status of every step, with the job id executing it. |
+| `wait_for_workflow(id, WaitOptions) -> models::Workflow` | Poll until a terminal workflow state. |
 
 ### Workflow builder
 
 ```rust
+use queueflow_sdk::models::{JobConfig, OnFailure};
+use queueflow_sdk::{Json, StepOptions, WorkflowBuilder};
+
 let dag = WorkflowBuilder::new("order_123")
     .step("validate", "validate_order", &[])
-    .step("pay", "process_payment", &["validate"])
-    .step("ship", "create_shipment", &["pay"]);
+    .step_with_options("pay", "process_payment", StepOptions {
+        after: vec!["validate".to_owned()],
+        payload: Some(Json::from([("amount".to_owned(), serde_json::json!(42))])),
+        on_failure: Some(OnFailure::Halt),
+        config: Some(JobConfig { max_retries: Some(5), ..JobConfig::new() }),
+        ..StepOptions::default()
+    })
+    .step("ship", "create_shipment", &["pay"])
+    .context(Json::from([("source".to_owned(), serde_json::json!("web"))]));
 let body = dag.build()?; // duplicate names, dangling deps and cycles fail here, before any request
 ```
 
-`step(name, task, after)` adds a step gated on the named `after` steps. `create_workflow` calls
-`build()` for you.
+`step(name, task, after)` adds a step gated on the named `after` steps; `step_with_options` adds
+`payload`, `config`, `on_failure`, `on_success` and `metadata`. `context` and `metadata` seed the
+workflow-level fields. `create_workflow` calls `build()` for you.
+
+### Worker
+
+Run task handlers in this process against a remote QueueFlow server:
+
+```rust
+use queueflow_sdk::{HandlerError, Handlers, Json, WorkerOptions};
+
+let handlers = Handlers::new()
+    .register("send-email", |ctx| async move {
+        // ctx.job is the leased models::Job; ctx.cancel fires if the lease is
+        // lost or the drain timeout passes (the handler future is dropped too).
+        let payload = ctx.job.payload.unwrap_or_default();
+        if payload.get("to").is_none() {
+            return Err(HandlerError::non_retryable("no recipient")); // dead-letters immediately
+        }
+        send_email(&payload).await?; // any std::error::Error converts to a retryable failure
+        Ok(Json::from([("sent".to_owned(), serde_json::json!(true))]))
+    });
+
+let opts = WorkerOptions {
+    concurrency: 4,                          // jobs in flight at once (default 1)
+    lease_secs: 30,                          // heartbeat at half this interval (default 30)
+    wait_secs: 20,                           // server-side long poll when idle (default 20, max 30)
+    drain_timeout: Duration::from_secs(30),  // wait for in-flight handlers after stop (default 30s)
+    ..WorkerOptions::default()
+};
+let stop = opts.stop.clone();                // a CancelToken; keep it to stop the worker
+let worker = tokio::spawn({
+    let qf = qf.clone();
+    async move { qf.run_worker("default", handlers, opts).await }
+});
+
+tokio::signal::ctrl_c().await?;
+stop.cancel();
+worker.await??;
+```
+
+`run_worker` leases up to `concurrency` jobs per call (one per free slot), runs each handler on
+its own tokio task, heartbeats every job at half the lease interval, and reports `complete` or
+`fail`. A heartbeat that shows the lease is lost (HTTP 409, or any status other than `running`)
+fires `ctx.cancel`, drops the handler future and suppresses the report; the server already owns
+the outcome. Jobs whose task has no handler are failed non-retryably; a panicking handler kills
+only its own task (its lease expires and the server redelivers).
+
+When `opts.stop` is cancelled, `run_worker` abandons the in-flight lease long-poll, waits up to
+`drain_timeout` for running handlers to finish and report, then returns `Ok(())`. It returns the
+`FacadeError::Http` when the lease call is rejected with 401 or 403 (a wrong or missing worker
+token cannot heal by retrying); other lease errors back off one second and are printed to
+stderr on the first failure and every 30th after that (`on_error` replaces that).
+
+Delivery is at-least-once, so handlers must be idempotent. Servers started with
+`--worker-token` require `QueueFlowOptions::worker_token`.
+
+The raw protocol is also exposed: `lease_jobs(queue, LeaseOptions)`,
+`heartbeat_job(&lease, extend_secs)`, `complete_job(&lease, result)`,
+`fail_job(&lease, message, retryable)`.
+
+### Cron
+
+| Method | Description |
+| --- | --- |
+| `create_cron(name, schedule, task) -> String` | Register a recurring enqueue (5-field crontab, UTC); returns the schedule id. |
+| `create_cron_with_options(name, schedule, task, CreateCronOptions) -> String` | Also set `payload`, `queue` and a `config` override. |
+| `get_cron(id)` / `list_crons(&ListOptions)` / `delete_cron(id)` | Fetch / list / delete. |
+| `pause_cron(id)` / `resume_cron(id)` | Stop firings / resume at the next future occurrence. |
+
+### Dead letters
+
+| Method | Description |
+| --- | --- |
+| `list_dead_letters(&ListOptions)` / `get_dead_letter(id: i64)` | Inspect terminally-failed jobs. |
+| `replay_dead_letter(id: i64) -> String` | Re-run one as a fresh job; returns the new job id (at most once; a second replay is a 409). |
+
+### System
+
+| Method | Description |
+| --- | --- |
+| `stats() -> models::StatsSnapshot` | Engine counters. |
+| `queues() -> Vec<models::QueueStats>` | Live per-queue backlog: `pending`, `scheduled`, `running`, `oldest_pending_age_secs`. |
+| `tasks() -> Vec<String>` | Registered task handler names. |
+| `health()` / `ready()` | `GET /health` / `GET /ready`. |
 
 ### Everything else: the generated client
 
-Anything the facade does not wrap is one call away in `queueflow_sdk::apis`, each function taking
-`&qf.config`:
+Anything the facade does not wrap (batch enqueue, raw request bodies) is one call away in
+`queueflow_sdk::apis`, each function taking `&qf.config`:
 
 ```rust
-use queueflow_sdk::apis::{cron_api, dlq_api, jobs_api, system_api, workflows_api};
-use queueflow_sdk::models::CreateJobRequest;
+use queueflow_sdk::apis::jobs_api;
+use queueflow_sdk::models::CreateBatchJobsRequest;
 
-// Idempotent create: the same key returns the original job instead of a duplicate.
-let mut req = CreateJobRequest::new("echo".to_owned());
-req.payload = Some(payload);
-let created = jobs_api::create_job(&qf.config, req, Some("order-123")).await?;
-
-// Lists take (status, queue, limit, offset, order_by, include_total, cursor, created_after, created_before).
-let failed = jobs_api::list_jobs(&qf.config, Some("failed"), None, Some(50), None, None, None, None, None, None).await?;
-let crons = cron_api::list_crons(&qf.config, None, None, Some(100), None, None, None, None, None, None).await?;
-let dlq = dlq_api::list_dead_letters(&qf.config, None, None, Some(10), None, None, None, None, None, None).await?;
-
-// Cron lifecycle.
-cron_api::pause_cron(&qf.config, &cron_id).await?;
-cron_api::resume_cron(&qf.config, &cron_id).await?;
-cron_api::delete_cron(&qf.config, &cron_id).await?;
-
-// Workflow progress and diagram.
-let states = workflows_api::get_workflow_step_states(&qf.config, &wf_id).await?;
-let diagram = workflows_api::get_workflow_diagram(&qf.config, &wf_id).await?;
-
-// Engine introspection.
-let stats = system_api::get_stats(&qf.config).await?;
-let tasks = system_api::list_tasks(&qf.config).await?;
+let batch = jobs_api::create_batch_jobs(&qf.config, CreateBatchJobsRequest::new(reqs)).await?;
 ```
 
-List responses carry `next_cursor` when there are more pages; pass it back as `cursor` for keyset
-pagination (cheaper than deep `offset`). Per-endpoint and per-model reference for the generated
-layer lives in [`docs/`](./docs).
+Per-endpoint and per-model reference for the generated layer lives in [`docs/`](./docs).
 
 ## Authentication
 
 Every request carries `Authorization: Bearer <token>`. Two credentials exist:
 
-- The **tenant token** (the `token` passed to `QueueFlow::new`) authenticates the job, workflow,
-  cron, DLQ and system routes. On a server started without `--api-keys`, any non-empty token is
-  accepted (development mode).
-- The **worker token** authenticates the worker-protocol routes (lease, heartbeat, complete,
-  fail). Configure it on the server with `--worker-token` / `QUEUEFLOW_WORKER_TOKEN`. It is a
-  separate secret, never a tenant token. Build a second `Configuration` for it:
-
-  ```rust
-  let mut worker_config = qf.config.clone();
-  worker_config.bearer_access_token = Some(worker_token.to_owned());
-  ```
-
-## Worker protocol
-
-This crate ships **no worker runtime**. If you are writing a Rust worker, use the first-party
-[`queueflow-client`](https://github.com/elision-labs/queueflow-core/tree/main/crates/queueflow-client)
-crate from the queueflow-core workspace: it shares the server's own domain types and ships a worker
-runtime with automatic heartbeating, lease-loss detection, and concurrent batch processing.
-
-If you do call `apis::worker_api` (`lease_jobs`, `heartbeat_job`, `complete_job`, `fail_job`)
-directly, three rules keep the at-least-once contract honest:
-
-1. Worker routes authenticate with the worker token, not a tenant token (see above).
-2. Heartbeat every in-flight job at roughly half its lease interval. A heartbeat whose `status`
-   is anything other than `running` (or an HTTP 409) means the server owns the outcome: abandon
-   the handler and report nothing.
-3. Delivery is at-least-once, so handlers must be idempotent. Report permanent failures with
-   `retryable: false` so they dead-letter immediately instead of burning retries.
+- The **tenant token** (`QueueFlowOptions::token`) authenticates the job, workflow, cron, DLQ and
+  system routes. On a server started without `--api-keys`, any non-empty token is accepted
+  (development mode).
+- The **worker token** (`QueueFlowOptions::worker_token`) authenticates the worker-protocol
+  routes (lease, heartbeat, complete, fail), used by `run_worker`. Configure it on the server
+  with `--worker-token` / `QUEUEFLOW_WORKER_TOKEN`. It is a separate secret, never a tenant
+  token. It defaults to the tenant token, which only works on a server running without one.
 
 ## Error handling
 
-Facade helpers return `FacadeError`:
+Facade methods return `FacadeError`:
 
-- `FacadeError::Api(Box<dyn Error>)`: the generated client failed (transport, decode, or a
-  non-2xx response). The source is an `apis::Error<T>`; its `ResponseError` variant carries the
-  HTTP `status`, raw `content`, and the decoded error `entity`.
-- `FacadeError::InvalidWorkflow(String)`: a DAG failed local validation, before any request.
-- `FacadeError::Timeout(String)`: a `wait_for_*` poller ran out of time.
-
-Generated functions return `apis::Error<OperationError>` directly:
+- `Http { op, status, body }`: a non-2xx response; `err.status()` returns `Some(status)`.
+- `Transport { op, source }`: no response, or it did not decode (connection refused, timeout,
+  TLS, JSON).
+- `InvalidWorkflow(String)`: a DAG failed local validation, before any request.
+- `InvalidOptions(String)`: `with_options` was given an empty `base_url` or `token`.
+- `Timeout(String)`: a `wait_for_*` poller, or a worker-protocol call, ran out of time.
 
 ```rust
-use queueflow_sdk::apis::{jobs_api, Error};
+use queueflow_sdk::FacadeError;
 
-match jobs_api::get_job(&qf.config, "missing").await {
+match qf.get_job("missing").await {
     Ok(job) => println!("{}", job.status),
-    Err(Error::ResponseError(resp)) if resp.status.as_u16() == 404 => println!("no such job"),
-    Err(Error::ResponseError(resp)) => eprintln!("{}: {}", resp.status, resp.content),
+    Err(err) if err.status() == Some(404) => println!("no such job"),
+    Err(FacadeError::Http { op, status, body }) => eprintln!("{} failed: HTTP {}: {}", op, status, body),
     Err(other) => return Err(other.into()),
 }
 ```
+
+Worker handlers return `HandlerError`: `Retryable(String)` (the server applies the job's retry
+policy) or `NonRetryable(String)` (dead-letters immediately). Any `std::error::Error` converts
+into `Retryable` with `?`; `HandlerError` deliberately does not implement `std::error::Error`
+itself, which is what makes that blanket conversion possible.
+
+Generated functions return `apis::Error<OperationError>` directly; its `ResponseError` variant
+carries the HTTP `status`, raw `content`, and the decoded error `entity`.
 
 ## Known limitation: `stream_job_events`
 
@@ -195,9 +291,11 @@ instead, or a hand-rolled SSE consumer over `GET /api/v1/jobs/{id}/events`.
 
 `tests/live.rs` runs the facade against a real QueueFlow server (started with the default
 `queueflow serve`, i.e. `--mode all`, so the built-in `echo` handler is registered). It creates
-and waits on an `echo` job, checks idempotent re-creation, runs a two-step workflow, exercises the
-cron and dead-letter endpoints, and reads stats. The tests skip themselves unless `QUEUEFLOW_URL`
-is set, so plain `cargo test` and CI stay offline.
+and waits on an `echo` job, checks idempotent re-creation and list filters, runs a two-step
+workflow, exercises the cron, dead-letter, queue backlog and stats endpoints, and runs
+`run_worker` against a dedicated queue: one scenario completes a job with a handler only the test
+knows, another dead-letters a job with `HandlerError::non_retryable` and replays it. The tests
+skip themselves unless `QUEUEFLOW_URL` is set, so plain `cargo test` and CI stay offline.
 
 ```bash
 QUEUEFLOW_URL=http://localhost:8000 \
@@ -206,8 +304,9 @@ QUEUEFLOW_WORKER_TOKEN=worker-secret \
 cargo test --test live
 ```
 
-`QUEUEFLOW_TOKEN` is the tenant token (default `dev`). `QUEUEFLOW_WORKER_TOKEN` is read for
-parity with the other SDKs but unused here, since this crate has no worker runtime.
+`QUEUEFLOW_TOKEN` is the tenant token (default `dev`). `QUEUEFLOW_WORKER_TOKEN` is the server's
+`--worker-token`; it defaults to the tenant token, which only works when the server runs without
+one.
 
 ## Architecture
 
@@ -216,7 +315,7 @@ This crate is a thin hand-written **facade** over a **generated core**:
 ```
 queueflow-sdk-rust/
 ├── src/
-│   ├── facade.rs        the hand-written facade (QueueFlow, WorkflowBuilder, FacadeError)
+│   ├── facade.rs        the hand-written facade (QueueFlow, run_worker, WorkflowBuilder, FacadeError)
 │   ├── lib.rs           declares and re-exports the facade
 │   ├── apis/            generated per-tag functions (jobs_api, workflows_api, worker_api, ...)
 │   └── models/          generated models
@@ -230,7 +329,8 @@ The core is generated by openapi-generator from the server's
 [OpenAPI spec](https://github.com/elision-labs/queueflow-core/blob/main/spec/openapi.yaml)
 (`scripts/generate-sdks.sh rust` in queueflow-core). The facade is injected at generation time
 from `sdk-templates/rust/facade.mustache` in that repo, so edit the template, not
-`src/facade.rs`.
+`src/facade.rs`. `Cargo.toml` and `src/lib.rs` come from `Cargo.mustache` and `lib.mustache`
+in the same directory.
 
 ### Development
 
