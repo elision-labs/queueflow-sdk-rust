@@ -20,7 +20,7 @@ The crate is `queueflow-sdk`; the bare `queueflow` crate name belongs to the ser
 ```toml
 [dependencies]
 queueflow-sdk = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 serde_json = "1"
 ```
 
@@ -148,6 +148,7 @@ workflow-level fields. `create_workflow` calls `build()` for you.
 Run task handlers in this process against a remote QueueFlow server:
 
 ```rust
+use std::time::Duration;
 use queueflow_sdk::{HandlerError, Handlers, Json, WorkerOptions};
 
 let handlers = Handlers::new()
