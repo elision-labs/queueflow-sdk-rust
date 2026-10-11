@@ -18,8 +18,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use queueflow_sdk::models::{JobStatus, StepStatus, WorkflowStatus};
 use queueflow_sdk::{
-    CreateJobOptions, HandlerError, Handlers, Json, ListOptions, QueueFlow, QueueFlowOptions,
-    StepOptions, WaitOptions, WorkerOptions, WorkflowBuilder,
+    CancelJobsFilter, CreateJobOptions, HandlerError, Handlers, Json, LeaseOptions, ListOptions,
+    QueueFlow, QueueFlowOptions, ReplayDeadLettersFilter, StepOptions, WaitOptions,
+    WorkerOptions, WorkflowBuilder,
 };
 use serde_json::{json, Value};
 
@@ -289,6 +290,323 @@ async fn live_dead_letter_list_queues_and_stats() {
         .find(|q| q.queue == queue)
         .unwrap_or_else(|| panic!("queue {} missing from queues(): {:?}", queue, queues));
     assert_eq!(entry.pending, 1);
+}
+
+#[tokio::test]
+async fn live_whoami_resolves_the_tenant_token() {
+    let Some(qf) = live_client() else { return };
+    let me = qf.whoami().await.expect("whoami");
+    assert!(!me.tenant.is_empty(), "empty tenant");
+    assert!(
+        me.access == "read_write" || me.access == "read_only",
+        "access = {:?}",
+        me.access
+    );
+    // The suite creates jobs, so the configured token must be read-write.
+    assert_eq!(me.access, "read_write");
+}
+
+/// Bulk cancel, scoped to a queue only this run uses (the server is shared):
+/// bounded by `limit`, narrowed by `status`, and a terminal status is
+/// rejected.
+#[tokio::test]
+async fn live_cancel_jobs_cancels_matching_jobs_up_to_limit() {
+    let Some(qf) = live_client() else { return };
+    let suffix = suffix();
+    let queue = format!("rust-live-cancel-{}", suffix);
+    let task = format!("rust-live-cancel-task-{}", suffix);
+
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let id = qf
+            .create_job_with_options(
+                &task,
+                CreateJobOptions {
+                    payload: Some(obj(json!({"n": n}))),
+                    queue: Some(queue.clone()),
+                    ..CreateJobOptions::default()
+                },
+            )
+            .await
+            .expect("create_job_with_options");
+        ids.push(id);
+    }
+
+    // task_name narrows the job list to exactly this run's jobs.
+    let listed = qf
+        .list_jobs(&ListOptions {
+            queue: Some(queue.clone()),
+            task_name: Some(task.clone()),
+            limit: Some(100),
+            ..ListOptions::default()
+        })
+        .await
+        .expect("list_jobs");
+    assert_eq!(listed.jobs.len(), 3, "{:?}", listed.jobs);
+
+    let cancelled = qf
+        .cancel_jobs(&CancelJobsFilter {
+            queue: Some(queue.clone()),
+            limit: Some(2),
+            ..CancelJobsFilter::default()
+        })
+        .await
+        .expect("cancel_jobs (limit 2)");
+    assert_eq!(cancelled, 2);
+    let mut statuses = Vec::new();
+    for id in &ids {
+        statuses.push(qf.get_job(id).await.expect("get_job").status);
+    }
+    assert_eq!(
+        statuses.iter().filter(|s| **s == JobStatus::Cancelled).count(),
+        2,
+        "{:?}",
+        statuses
+    );
+    assert_eq!(
+        statuses.iter().filter(|s| **s == JobStatus::Pending).count(),
+        1,
+        "{:?}",
+        statuses
+    );
+
+    let cancelled = qf
+        .cancel_jobs(&CancelJobsFilter {
+            queue: Some(queue.clone()),
+            task_name: Some(task.clone()),
+            status: Some("pending".to_owned()),
+            ..CancelJobsFilter::default()
+        })
+        .await
+        .expect("cancel_jobs (pending)");
+    assert_eq!(cancelled, 1);
+
+    let cancelled = qf
+        .cancel_jobs(&CancelJobsFilter {
+            queue: Some(queue.clone()),
+            ..CancelJobsFilter::default()
+        })
+        .await
+        .expect("cancel_jobs (exhausted)");
+    assert_eq!(cancelled, 0, "nothing left to cancel");
+
+    match qf
+        .cancel_jobs(&CancelJobsFilter {
+            queue: Some(queue.clone()),
+            status: Some("completed".to_owned()),
+            ..CancelJobsFilter::default()
+        })
+        .await
+    {
+        Err(err) if err.status() == Some(400) => {}
+        other => panic!("cancel_jobs with a terminal status: {:?}, want 400", other),
+    }
+}
+
+/// Bulk replay, scoped to a queue only this run uses: two dead letters are
+/// replayed in one call, the `replayed` list filter flips from unreplayed to
+/// replayed, and the fresh jobs are cancelled by queue afterwards.
+#[tokio::test]
+async fn live_replay_dead_letters_replays_unreplayed_entries_once() {
+    let Some(qf) = live_client() else { return };
+    let suffix = suffix();
+    let queue = format!("rust-live-replay-{}", suffix);
+    let task = format!("rust-live-replay-task-{}", suffix);
+
+    let mut ids = Vec::new();
+    for n in 0..2 {
+        let id = qf
+            .create_job_with_options(
+                &task,
+                CreateJobOptions {
+                    payload: Some(obj(json!({"n": n}))),
+                    queue: Some(queue.clone()),
+                    ..CreateJobOptions::default()
+                },
+            )
+            .await
+            .expect("create_job_with_options");
+        ids.push(id);
+    }
+    let handlers = Handlers::new().register(&task, |ctx| async move {
+        Err(HandlerError::non_retryable(format!("poison {}", ctx.job.id)))
+    });
+    let done = with_worker(&qf, &queue, handlers, async {
+        let mut done = Vec::new();
+        for id in &ids {
+            done.push(qf.wait_for_job(id, WAIT).await.expect("wait_for_job"));
+        }
+        done
+    })
+    .await;
+    for job in &done {
+        assert_eq!(job.status, JobStatus::Failed, "job {}", job.id);
+    }
+
+    let unreplayed = qf
+        .list_dead_letters(&ListOptions {
+            queue: Some(queue.clone()),
+            replayed: Some(false),
+            limit: Some(10),
+            ..ListOptions::default()
+        })
+        .await
+        .expect("list_dead_letters (unreplayed)");
+    assert_eq!(unreplayed.dead_letters.len(), 2, "{:?}", unreplayed.dead_letters);
+
+    let results = qf
+        .replay_dead_letters(&ReplayDeadLettersFilter {
+            queue: Some(queue.clone()),
+            task_name: Some(task.clone()),
+            ..ReplayDeadLettersFilter::default()
+        })
+        .await
+        .expect("replay_dead_letters");
+    assert_eq!(results.len(), 2, "{:?}", results);
+    let mut replayed_ids: Vec<i64> = results.iter().map(|r| r.dead_letter_id).collect();
+    replayed_ids.sort_unstable();
+    let mut want_ids: Vec<i64> = unreplayed.dead_letters.iter().map(|d| d.id).collect();
+    want_ids.sort_unstable();
+    assert_eq!(replayed_ids, want_ids);
+    let fresh: Vec<String> = results
+        .iter()
+        .map(|r| {
+            let job_id = r.job_id.clone().flatten();
+            assert!(job_id.is_some(), "no job_id: {:?}", r);
+            job_id.unwrap()
+        })
+        .collect();
+    for id in &fresh {
+        assert!(!ids.contains(id), "replay reused the original id {}", id);
+    }
+
+    // A second bulk replay finds nothing: entries replay at most once.
+    let again = qf
+        .replay_dead_letters(&ReplayDeadLettersFilter {
+            queue: Some(queue.clone()),
+            ..ReplayDeadLettersFilter::default()
+        })
+        .await
+        .expect("replay_dead_letters (again)");
+    assert!(again.is_empty(), "{:?}", again);
+
+    let still_unreplayed = qf
+        .list_dead_letters(&ListOptions {
+            queue: Some(queue.clone()),
+            replayed: Some(false),
+            limit: Some(10),
+            ..ListOptions::default()
+        })
+        .await
+        .expect("list_dead_letters (unreplayed, after)");
+    assert!(still_unreplayed.dead_letters.is_empty());
+    let replayed = qf
+        .list_dead_letters(&ListOptions {
+            queue: Some(queue.clone()),
+            task_name: Some(task.clone()),
+            replayed: Some(true),
+            limit: Some(10),
+            ..ListOptions::default()
+        })
+        .await
+        .expect("list_dead_letters (replayed)");
+    assert_eq!(replayed.dead_letters.len(), 2);
+    for entry in &replayed.dead_letters {
+        let replay_job = entry.replay_job_id.clone().flatten();
+        assert!(
+            replay_job.as_ref().is_some_and(|j| fresh.contains(j)),
+            "replay_job_id {:?} not among {:?}",
+            replay_job,
+            fresh
+        );
+    }
+
+    // The fresh jobs wait on this run's queue; cancel them by queue.
+    let cancelled = qf
+        .cancel_jobs(&CancelJobsFilter {
+            queue: Some(queue.clone()),
+            ..CancelJobsFilter::default()
+        })
+        .await
+        .expect("cancel_jobs");
+    assert_eq!(cancelled, 2);
+}
+
+/// Pausing a queue only this run uses stops leases of its jobs until it is
+/// resumed; both calls are idempotent and `queues()` reflects the flag.
+#[tokio::test]
+async fn live_pause_queue_blocks_leases_until_resume() {
+    let Some(qf) = live_client() else { return };
+    let suffix = suffix();
+    let queue = format!("rust-live-pause-{}", suffix);
+    let task = format!("rust-live-pause-task-{}", suffix);
+
+    let id = qf
+        .create_job_with_options(
+            &task,
+            CreateJobOptions {
+                queue: Some(queue.clone()),
+                ..CreateJobOptions::default()
+            },
+        )
+        .await
+        .expect("create_job_with_options");
+
+    let paused = qf.pause_queue(&queue).await.expect("pause_queue");
+    assert_eq!(paused.queue, queue);
+    assert!(paused.paused);
+    assert_eq!(paused.pending, 1);
+    assert_eq!(paused.running, 0);
+    let again = qf.pause_queue(&queue).await.expect("pause_queue (again)");
+    assert!(again.paused, "pause must be idempotent");
+
+    let queues = qf.queues().await.expect("queues");
+    let entry = queues
+        .iter()
+        .find(|q| q.queue == queue)
+        .unwrap_or_else(|| panic!("queue {} missing from queues(): {:?}", queue, queues));
+    assert_eq!(entry.paused, Some(true));
+
+    let leased = qf
+        .lease_jobs(
+            &queue,
+            LeaseOptions {
+                wait_secs: Some(1),
+                ..LeaseOptions::default()
+            },
+        )
+        .await
+        .expect("lease_jobs (paused)");
+    assert!(leased.is_empty(), "leased from a paused queue: {:?}", leased);
+    assert_eq!(
+        qf.get_job(&id).await.expect("get_job").status,
+        JobStatus::Pending
+    );
+
+    let resumed = qf.resume_queue(&queue).await.expect("resume_queue");
+    assert!(!resumed.paused);
+    assert_eq!(resumed.pending, 1);
+    let again = qf.resume_queue(&queue).await.expect("resume_queue (again)");
+    assert!(!again.paused, "resume must be idempotent");
+
+    let leased = qf
+        .lease_jobs(
+            &queue,
+            LeaseOptions {
+                lease_secs: Some(30),
+                wait_secs: Some(5),
+                ..LeaseOptions::default()
+            },
+        )
+        .await
+        .expect("lease_jobs (resumed)");
+    assert_eq!(leased.len(), 1, "{:?}", leased);
+    assert_eq!(leased[0].job.id, id);
+    qf.complete_job(&leased[0], obj(json!({"paused_then_resumed": true})))
+        .await
+        .expect("complete_job");
+    let done = qf.wait_for_job(&id, WAIT).await.expect("wait_for_job");
+    assert_eq!(done.status, JobStatus::Completed);
 }
 
 /// The worker runtime: enqueue on a queue the server's in-process workers

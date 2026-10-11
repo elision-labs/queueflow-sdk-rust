@@ -18,9 +18,9 @@ use std::time::{Duration, Instant};
 
 use queueflow_sdk::models::{BackoffStrategy, JobConfig, JobStatus, OnFailure, OnSuccess};
 use queueflow_sdk::{
-    CreateCronOptions, CreateJobOptions, FacadeError, HandlerError, Handlers, Json, LeaseOptions,
-    ListOptions, QueueFlow, QueueFlowOptions, StepOptions, WaitOptions, WorkerOptions,
-    WorkflowBuilder,
+    CancelJobsFilter, CreateCronOptions, CreateJobOptions, FacadeError, HandlerError, Handlers,
+    Json, LeaseOptions, ListOptions, QueueFlow, QueueFlowOptions, ReplayDeadLettersFilter,
+    StepOptions, WaitOptions, WorkerOptions, WorkflowBuilder,
 };
 use serde_json::{json, Value};
 use wiremock::matchers::{header, method, path, path_regex};
@@ -419,8 +419,128 @@ async fn list_jobs_forwards_set_filters_and_omits_unset_ones() {
         query.get("created_after").map(String::as_str),
         Some("2026-01-01T00:00:00Z")
     );
-    for absent in ["offset", "order_by", "include_total", "created_before"] {
+    for absent in ["offset", "order_by", "include_total", "created_before", "task_name", "replayed"] {
         assert!(!query.contains_key(absent), "{} must be omitted", absent);
+    }
+}
+
+fn query_of(req: &Request) -> HashMap<String, String> {
+    req.url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect()
+}
+
+#[tokio::test]
+async fn list_filters_forward_task_name_and_replayed() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/jobs"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "jobs": [], "limit": 50, "offset": 0, "has_more": false
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/dlq"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "dead_letters": [], "limit": 50, "offset": 0, "has_more": false
+        })))
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "t");
+    qf.list_jobs(&ListOptions {
+        task_name: Some("send-email".to_owned()),
+        ..ListOptions::default()
+    })
+    .await
+    .expect("list_jobs");
+    let jobs_query = query_of(&requests_to(&server, "/api/v1/jobs").await[0]);
+    assert_eq!(jobs_query.get("task_name").map(String::as_str), Some("send-email"));
+    assert!(!jobs_query.contains_key("replayed"));
+
+    qf.list_dead_letters(&ListOptions {
+        queue: Some("billing".to_owned()),
+        task_name: Some("charge".to_owned()),
+        replayed: Some(false),
+        ..ListOptions::default()
+    })
+    .await
+    .expect("list_dead_letters");
+    let dlq_query = query_of(&requests_to(&server, "/api/v1/dlq").await[0]);
+    assert_eq!(dlq_query.get("queue").map(String::as_str), Some("billing"));
+    assert_eq!(dlq_query.get("task_name").map(String::as_str), Some("charge"));
+    assert_eq!(dlq_query.get("replayed").map(String::as_str), Some("false"));
+}
+
+#[tokio::test]
+async fn cancel_jobs_posts_the_filter_and_returns_the_count() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/cancel"))
+        .and(header("authorization", "Bearer t"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"cancelled": 2})))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "t");
+    let cancelled = qf
+        .cancel_jobs(&CancelJobsFilter {
+            queue: Some("billing".to_owned()),
+            status: Some("pending".to_owned()),
+            limit: Some(2),
+            created_before: Some("2026-02-01T00:00:00Z".to_owned()),
+            ..CancelJobsFilter::default()
+        })
+        .await
+        .expect("cancel_jobs");
+    assert_eq!(cancelled, 2);
+    // An empty filter is an empty JSON object: unset fields are not sent as
+    // nulls, so the server defaults apply.
+    qf.cancel_jobs(&CancelJobsFilter::default())
+        .await
+        .expect("cancel_jobs (empty filter)");
+
+    let posts = requests_to(&server, "/api/v1/jobs/cancel").await;
+    assert_eq!(
+        body_json(&posts[0]),
+        json!({
+            "queue": "billing", "status": "pending", "limit": 2,
+            "created_before": "2026-02-01T00:00:00Z"
+        })
+    );
+    assert_eq!(body_json(&posts[1]), json!({}));
+}
+
+#[tokio::test]
+async fn cancel_jobs_with_a_terminal_status_is_a_400() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/jobs/cancel"))
+        .respond_with(
+            ResponseTemplate::new(400)
+                .set_body_json(json!({"error": "status completed is terminal"})),
+        )
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "t");
+    let err = qf
+        .cancel_jobs(&CancelJobsFilter {
+            status: Some("completed".to_owned()),
+            ..CancelJobsFilter::default()
+        })
+        .await
+        .expect_err("400 must fail");
+    match err {
+        FacadeError::Http { op, status, body } => {
+            assert_eq!(op, "cancel_jobs");
+            assert_eq!(status, 400);
+            assert!(body.contains("terminal"), "body = {:?}", body);
+        }
+        other => panic!("expected Http, got {:?}", other),
     }
 }
 
@@ -430,7 +550,8 @@ async fn queues_and_tasks_unwrap_their_envelopes() {
     Mock::given(method("GET"))
         .and(path("/api/v1/queues"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"queues": [
-            {"queue": "default", "pending": 2, "scheduled": 0, "running": 1, "oldest_pending_age_secs": 12}
+            {"queue": "default", "pending": 2, "scheduled": 0, "running": 1, "oldest_pending_age_secs": 12, "paused": true},
+            {"queue": "legacy", "pending": 0, "scheduled": 1, "running": 0}
         ]})))
         .mount(&server)
         .await;
@@ -442,10 +563,13 @@ async fn queues_and_tasks_unwrap_their_envelopes() {
 
     let qf = QueueFlow::new(&server.uri(), "t");
     let queues = qf.queues().await.expect("queues");
-    assert_eq!(queues.len(), 1);
+    assert_eq!(queues.len(), 2);
     assert_eq!(queues[0].queue, "default");
     assert_eq!(queues[0].pending, 2);
     assert_eq!(queues[0].oldest_pending_age_secs, Some(Some(12)));
+    assert_eq!(queues[0].paused, Some(true));
+    // A pre-0.5 server omits `paused`; the field must stay optional.
+    assert_eq!(queues[1].paused, None);
     assert_eq!(qf.tasks().await.expect("tasks"), vec!["echo", "sleep"]);
 }
 
@@ -641,6 +765,112 @@ async fn create_cron_with_options_sends_queue_and_payload() {
     assert_eq!(posted["queue"], "reports");
     assert_eq!(posted["payload"]["from"], "cron");
     assert!(posted.get("config").is_none());
+}
+
+// --- Dead letters ----------------------------------------------------------
+
+#[tokio::test]
+async fn replay_dead_letters_posts_the_filter_and_unwraps_results() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/dlq/replay"))
+        .and(header("authorization", "Bearer t"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "replayed": 1,
+            "results": [
+                {"dead_letter_id": 7, "job_id": "j7"},
+                {"dead_letter_id": 8, "error": "original job purged by retention"}
+            ]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "t");
+    let results = qf
+        .replay_dead_letters(&ReplayDeadLettersFilter {
+            queue: Some("billing".to_owned()),
+            task_name: Some("charge".to_owned()),
+            limit: Some(10),
+            ..ReplayDeadLettersFilter::default()
+        })
+        .await
+        .expect("replay_dead_letters");
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].dead_letter_id, 7);
+    assert_eq!(results[0].job_id, Some(Some("j7".to_owned())));
+    assert_eq!(results[0].error, None);
+    assert_eq!(results[1].dead_letter_id, 8);
+    assert_eq!(results[1].job_id, None);
+    assert_eq!(
+        results[1].error,
+        Some(Some("original job purged by retention".to_owned()))
+    );
+
+    let posted = body_json(&requests_to(&server, "/api/v1/dlq/replay").await[0]);
+    assert_eq!(
+        posted,
+        json!({"queue": "billing", "task_name": "charge", "limit": 10})
+    );
+}
+
+// --- System ----------------------------------------------------------------
+
+#[tokio::test]
+async fn pause_and_resume_queue_post_to_the_queue_control_routes() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/queues/billing/pause"))
+        .and(header("authorization", "Bearer t"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "queue": "billing", "paused": true, "running": 3, "pending": 12
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/queues/billing/resume"))
+        .and(header("authorization", "Bearer t"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "queue": "billing", "paused": false, "running": 0, "pending": 12
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "t");
+    let paused = qf.pause_queue("billing").await.expect("pause_queue");
+    assert_eq!(paused.queue, "billing");
+    assert!(paused.paused);
+    assert_eq!(paused.running, 3);
+    assert_eq!(paused.pending, 12);
+
+    let resumed = qf.resume_queue("billing").await.expect("resume_queue");
+    assert!(!resumed.paused);
+    assert_eq!(resumed.running, 0);
+
+    let err = qf.pause_queue("other").await.expect_err("unmocked queue");
+    assert_eq!(err.status(), Some(404));
+    assert!(matches!(err, FacadeError::Http { op: "pause_queue", .. }), "got {:?}", err);
+}
+
+#[tokio::test]
+async fn whoami_returns_the_tenant_and_access_of_the_token() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/whoami"))
+        .and(header("authorization", "Bearer acme:ro"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "tenant": "acme", "access": "read_only"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "acme:ro");
+    let me = qf.whoami().await.expect("whoami");
+    assert_eq!(me.tenant, "acme");
+    assert_eq!(me.access, "read_only");
 }
 
 // --- Worker runtime --------------------------------------------------------

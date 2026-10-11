@@ -19,7 +19,7 @@ The crate is `queueflow-sdk`; the bare `queueflow` crate name belongs to the ser
 
 ```toml
 [dependencies]
-queueflow-sdk = "0.3"
+queueflow-sdk = "0.4"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 serde_json = "1"
 ```
@@ -93,8 +93,9 @@ metadata.
 | `create_job(task, payload: Option<Json>) -> String` | Enqueue with the server defaults; returns the job id. |
 | `create_job_with_options(task, CreateJobOptions) -> String` | Enqueue with config, idempotency key and `run_at`; returns the job id. |
 | `get_job(id) -> models::Job` | Fetch a job. |
-| `list_jobs(&ListOptions) -> models::ListJobsResponse` | List jobs (`status`, `queue`, `limit`, `offset`, `order_by`, `include_total`, `cursor`, `created_after`, `created_before`). |
+| `list_jobs(&ListOptions) -> models::ListJobsResponse` | List jobs (`status`, `queue`, `task_name`, `limit`, `offset`, `order_by`, `include_total`, `cursor`, `created_after`, `created_before`). |
 | `cancel_job(id)` | Cancel a job. |
+| `cancel_jobs(&CancelJobsFilter) -> u64` | Cancel every non-terminal job matching the filter, up to `limit`; returns how many were cancelled. |
 | `wait_for_job(id, WaitOptions) -> models::Job` | Poll until `completed` / `failed` / `cancelled`. |
 
 `CreateJobOptions` is `{payload, queue, priority, max_retries, timeout_secs, retry_backoff,
@@ -108,6 +109,23 @@ string. The same `idempotency_key` returns the original job id.
 
 List responses carry `next_cursor` when there are more pages; pass it back as `cursor` for keyset
 pagination (cheaper than deep `offset`).
+
+`CancelJobsFilter` is `{queue, task_name, status, created_after, created_before, limit}`, all
+`Option`s with `Default`; unset fields are not sent. `status` narrows to `pending`, `retrying` or
+`running` (a terminal status is a 400). The server cancels at most `limit` jobs per call (default
+100), so a return value below the limit means the matching set is exhausted; jobs that finish
+concurrently are left as they ended.
+
+```rust
+use queueflow_sdk::CancelJobsFilter;
+
+let n = qf.cancel_jobs(&CancelJobsFilter {
+    queue: Some("billing".to_owned()),
+    status: Some("pending".to_owned()),
+    ..CancelJobsFilter::default()
+}).await?;
+println!("cancelled {} pending billing jobs", n);
+```
 
 ### Workflows
 
@@ -214,17 +232,43 @@ The raw protocol is also exposed: `lease_jobs(queue, LeaseOptions)`,
 
 | Method | Description |
 | --- | --- |
-| `list_dead_letters(&ListOptions)` / `get_dead_letter(id: i64)` | Inspect terminally-failed jobs. |
+| `list_dead_letters(&ListOptions)` / `get_dead_letter(id: i64)` | Inspect terminally-failed jobs. `ListOptions::task_name` and `ListOptions::replayed` (`Some(false)` = not yet replayed, `Some(true)` = replayed) narrow the list. |
 | `replay_dead_letter(id: i64) -> String` | Re-run one as a fresh job; returns the new job id (at most once; a second replay is a 409). |
+| `replay_dead_letters(&ReplayDeadLettersFilter) -> Vec<models::ReplayedDeadLetter>` | Re-run every unreplayed entry matching the filter, up to `limit`; each result has the `dead_letter_id` plus the new `job_id` or an `error`. |
+
+`ReplayDeadLettersFilter` is `{queue, task_name, created_after, created_before, limit}`, all
+`Option`s with `Default`. Only unreplayed entries are considered, so calling it again replays
+only what the previous call did not reach (default `limit` 100).
+
+```rust
+use queueflow_sdk::ReplayDeadLettersFilter;
+
+let results = qf.replay_dead_letters(&ReplayDeadLettersFilter {
+    queue: Some("billing".to_owned()),
+    ..ReplayDeadLettersFilter::default()
+}).await?;
+for r in &results {
+    match (&r.job_id, &r.error) {
+        (Some(Some(job)), _) => println!("dead letter {} replayed as job {}", r.dead_letter_id, job),
+        (_, Some(Some(err))) => println!("dead letter {} not replayed: {}", r.dead_letter_id, err),
+        _ => {}
+    }
+}
+```
 
 ### System
 
 | Method | Description |
 | --- | --- |
 | `stats() -> models::StatsSnapshot` | Engine counters. |
-| `queues() -> Vec<models::QueueStats>` | Live per-queue backlog: `pending`, `scheduled`, `running`, `oldest_pending_age_secs`. |
+| `queues() -> Vec<models::QueueStats>` | Live per-queue backlog: `pending`, `scheduled`, `running`, `oldest_pending_age_secs`, `paused`. |
+| `pause_queue(name)` / `resume_queue(name) -> models::QueueControlResponse` | Stop / allow claims of this tenant's jobs on a queue. Idempotent; the response carries `paused`, `running` and `pending`. |
 | `tasks() -> Vec<String>` | Registered task handler names. |
+| `whoami() -> models::WhoAmIResponse` | The `tenant` the token is scoped to and its `access` (`read_write` or `read_only`). |
 | `health()` / `ready()` | `GET /health` / `GET /ready`. |
+
+Pausing a queue stops workers claiming this tenant's jobs on it; jobs already running finish, so
+the queue is drained once `running` reaches zero. Pending jobs accumulate until `resume_queue`.
 
 ### Everything else: the generated client
 
@@ -293,10 +337,12 @@ instead, or a hand-rolled SSE consumer over `GET /api/v1/jobs/{id}/events`.
 `tests/live.rs` runs the facade against a real QueueFlow server (started with the default
 `queueflow serve`, i.e. `--mode all`, so the built-in `echo` handler is registered). It creates
 and waits on an `echo` job, checks idempotent re-creation and list filters, runs a two-step
-workflow, exercises the cron, dead-letter, queue backlog and stats endpoints, and runs
+workflow, exercises the cron, dead-letter, queue backlog, stats and `whoami` endpoints, and runs
 `run_worker` against a dedicated queue: one scenario completes a job with a handler only the test
-knows, another dead-letters a job with `HandlerError::non_retryable` and replays it. The tests
-skip themselves unless `QUEUEFLOW_URL` is set, so plain `cargo test` and CI stay offline.
+knows, another dead-letters a job with `HandlerError::non_retryable` and replays it. Bulk cancel,
+bulk replay and pause/resume each run against a queue named for that run alone, so the suite is
+safe on a shared server. The tests skip themselves unless `QUEUEFLOW_URL` is set, so plain
+`cargo test` and CI stay offline.
 
 ```bash
 QUEUEFLOW_URL=http://localhost:8000 \
