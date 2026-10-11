@@ -5,6 +5,7 @@
 Name | Type | Description | Notes
 ------------ | ------------- | ------------- | -------------
 **oldest_pending_age_secs** | Option<**i64**> | Seconds the oldest claimable job has been waiting, `None` when nothing is claimable. The queue's primary health signal: it grows when workers cannot keep up and stays near zero when they can. | [optional]
+**paused** | Option<**bool**> | Claims for this tenant's jobs on the queue are paused (see `POST /api/v1/queues/{queue}/pause`). Pending jobs accumulate; running ones finish. In the all-tenants view this is true only when every registered tenant of the queue is paused. | [optional]
 **pending** | **i64** | Claimable now: `pending` or `retrying` with `scheduled_at` in the past. | 
 **queue** | **String** |  | 
 **running** | **i64** | Currently leased by a worker. | 

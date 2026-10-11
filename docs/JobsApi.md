@@ -5,6 +5,7 @@ All URIs are relative to *http://localhost:8000*
 Method | HTTP request | Description
 ------------- | ------------- | -------------
 [**cancel_job**](JobsApi.md#cancel_job) | **POST** /api/v1/jobs/{id}/cancel | 
+[**cancel_jobs**](JobsApi.md#cancel_jobs) | **POST** /api/v1/jobs/cancel | 
 [**create_batch_jobs**](JobsApi.md#create_batch_jobs) | **POST** /api/v1/jobs/batch | 
 [**create_job**](JobsApi.md#create_job) | **POST** /api/v1/jobs | 
 [**get_job**](JobsApi.md#get_job) | **GET** /api/v1/jobs/{id} | 
@@ -36,6 +37,34 @@ Name | Type | Description  | Required | Notes
 ### HTTP request headers
 
 - **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## cancel_jobs
+
+> models::CancelJobsResponse cancel_jobs(cancel_jobs_request)
+
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**cancel_jobs_request** | [**CancelJobsRequest**](CancelJobsRequest.md) |  | [required] |
+
+### Return type
+
+[**models::CancelJobsResponse**](CancelJobsResponse.md)
+
+### Authorization
+
+[bearerAuth](../README.md#bearerAuth)
+
+### HTTP request headers
+
+- **Content-Type**: application/json
 - **Accept**: application/json
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
@@ -128,7 +157,7 @@ Name | Type | Description  | Required | Notes
 
 ## list_jobs
 
-> models::ListJobsResponse list_jobs(status, queue, limit, offset, order_by, include_total, cursor, created_after, created_before)
+> models::ListJobsResponse list_jobs(status, queue, task_name, replayed, limit, offset, order_by, include_total, cursor, created_after, created_before)
 
 
 ### Parameters
@@ -138,6 +167,8 @@ Name | Type | Description  | Required | Notes
 ------------- | ------------- | ------------- | ------------- | -------------
 **status** | Option<**String**> | Filter by status (e.g. `pending`, `completed`). |  |
 **queue** | Option<**String**> | Filter by queue name (jobs only). |  |
+**task_name** | Option<**String**> | Filter by task name (jobs and dead letters). |  |
+**replayed** | Option<**bool**> | Dead letters only: `false` lists entries not yet replayed, `true` the replayed ones; both when omitted. |  |
 **limit** | Option<**i64**> | Page size, 1..=100 (default 50). |  |
 **offset** | Option<**i64**> | Number of records to skip (default 0). |  |
 **order_by** | Option<**String**> | `created_at ASC` or `created_at DESC` (default DESC). |  |

@@ -99,7 +99,7 @@ Name | Type | Description  | Required | Notes
 
 ## list_crons
 
-> models::ListCronsResponse list_crons(status, queue, limit, offset, order_by, include_total, cursor, created_after, created_before)
+> models::ListCronsResponse list_crons(status, queue, task_name, replayed, limit, offset, order_by, include_total, cursor, created_after, created_before)
 
 
 ### Parameters
@@ -109,6 +109,8 @@ Name | Type | Description  | Required | Notes
 ------------- | ------------- | ------------- | ------------- | -------------
 **status** | Option<**String**> | Filter by status (e.g. `pending`, `completed`). |  |
 **queue** | Option<**String**> | Filter by queue name (jobs only). |  |
+**task_name** | Option<**String**> | Filter by task name (jobs and dead letters). |  |
+**replayed** | Option<**bool**> | Dead letters only: `false` lists entries not yet replayed, `true` the replayed ones; both when omitted. |  |
 **limit** | Option<**i64**> | Page size, 1..=100 (default 50). |  |
 **offset** | Option<**i64**> | Number of records to skip (default 0). |  |
 **order_by** | Option<**String**> | `created_at ASC` or `created_at DESC` (default DESC). |  |

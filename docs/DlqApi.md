@@ -7,6 +7,7 @@ Method | HTTP request | Description
 [**get_dead_letter**](DlqApi.md#get_dead_letter) | **GET** /api/v1/dlq/{id} | 
 [**list_dead_letters**](DlqApi.md#list_dead_letters) | **GET** /api/v1/dlq | 
 [**replay_dead_letter**](DlqApi.md#replay_dead_letter) | **POST** /api/v1/dlq/{id}/replay | 
+[**replay_dead_letters**](DlqApi.md#replay_dead_letters) | **POST** /api/v1/dlq/replay | 
 
 
 
@@ -40,7 +41,7 @@ Name | Type | Description  | Required | Notes
 
 ## list_dead_letters
 
-> models::ListDeadLettersResponse list_dead_letters(status, queue, limit, offset, order_by, include_total, cursor, created_after, created_before)
+> models::ListDeadLettersResponse list_dead_letters(status, queue, task_name, replayed, limit, offset, order_by, include_total, cursor, created_after, created_before)
 
 
 ### Parameters
@@ -50,6 +51,8 @@ Name | Type | Description  | Required | Notes
 ------------- | ------------- | ------------- | ------------- | -------------
 **status** | Option<**String**> | Filter by status (e.g. `pending`, `completed`). |  |
 **queue** | Option<**String**> | Filter by queue name (jobs only). |  |
+**task_name** | Option<**String**> | Filter by task name (jobs and dead letters). |  |
+**replayed** | Option<**bool**> | Dead letters only: `false` lists entries not yet replayed, `true` the replayed ones; both when omitted. |  |
 **limit** | Option<**i64**> | Page size, 1..=100 (default 50). |  |
 **offset** | Option<**i64**> | Number of records to skip (default 0). |  |
 **order_by** | Option<**String**> | `created_at ASC` or `created_at DESC` (default DESC). |  |
@@ -97,6 +100,34 @@ Name | Type | Description  | Required | Notes
 ### HTTP request headers
 
 - **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## replay_dead_letters
+
+> models::ReplayDeadLettersResponse replay_dead_letters(replay_dead_letters_request)
+
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**replay_dead_letters_request** | [**ReplayDeadLettersRequest**](ReplayDeadLettersRequest.md) |  | [required] |
+
+### Return type
+
+[**models::ReplayDeadLettersResponse**](ReplayDeadLettersResponse.md)
+
+### Authorization
+
+[bearerAuth](../README.md#bearerAuth)
+
+### HTTP request headers
+
+- **Content-Type**: application/json
 - **Accept**: application/json
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
