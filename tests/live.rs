@@ -13,10 +13,13 @@ Run with `cargo test --test live`. Plain `cargo test` collects it too, but it
 skips itself, so CI stays offline.
 */
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use queueflow_sdk::models::{JobStatus, StepStatus, WorkflowStatus};
+use queueflow_sdk::models::{
+    ConditionOp, FanOut, JobStatus, StepCondition, StepStatus, WorkflowStatus,
+};
 use queueflow_sdk::{
     CancelJobsFilter, CreateJobOptions, HandlerError, Handlers, Json, LeaseOptions, ListOptions,
     QueueFlow, QueueFlowOptions, ReplayDeadLettersFilter, StepOptions, WaitOptions,
@@ -719,5 +722,421 @@ async fn live_worker_non_retryable_failure_dead_letters() {
     match second {
         Err(err) if err.status() == Some(409) => {}
         other => panic!("second replay: {:?}, want 409", other),
+    }
+}
+
+// --- Workflows v2 ------------------------------------------------------------
+//
+// Each scenario puts every step on a queue named for this run alone and runs
+// its own worker against it, so the suite is safe on a shared server.
+
+/// A queue only this run uses.
+fn run_queue() -> String {
+    format!("rust-live-{}", uuid::Uuid::new_v4())
+}
+
+/// `StepOptions` for a step on `queue`, gated on `after`.
+fn on(queue: &str, after: &[&str]) -> StepOptions {
+    StepOptions {
+        after: after.iter().map(|d| d.to_string()).collect(),
+        queue: Some(queue.to_owned()),
+        ..StepOptions::default()
+    }
+}
+
+/// A leaf condition `path op value`.
+fn leaf(path: &str, op: ConditionOp, value: Value) -> StepCondition {
+    StepCondition {
+        path: Some(Some(path.to_owned())),
+        op: Some(Some(op)),
+        value: Some(Some(value)),
+        ..StepCondition::new()
+    }
+}
+
+/// The `_context` the engine injected into a step job's payload.
+fn context_of(payload: &Option<Json>) -> Value {
+    payload
+        .as_ref()
+        .and_then(|p| p.get("_context").cloned())
+        .unwrap_or(Value::Null)
+}
+
+/// Looks up a step's live state by name.
+fn state<'a>(
+    states: &'a [queueflow_sdk::models::WorkflowStepState],
+    name: &str,
+) -> &'a queueflow_sdk::models::WorkflowStepState {
+    states
+        .iter()
+        .find(|s| s.name == name)
+        .unwrap_or_else(|| panic!("no step {:?} in {:?}", name, states))
+}
+
+/// A false `when` skips the step with `condition not met` and its dependents
+/// still run (without its result in their context); a true `when` runs it.
+#[tokio::test]
+async fn live_condition_skipped_step_satisfies_its_dependents() {
+    let Some(qf) = live_client() else { return };
+    let queue = run_queue();
+
+    let dag = WorkflowBuilder::new(&format!("rust-live-when-{}", suffix()))
+        .step_with_options("gate", "score", on(&queue, &[]))
+        .step_with_options(
+            "review",
+            "review",
+            StepOptions {
+                when: Some(leaf("gate.score", ConditionOp::Gt, json!(0.8))),
+                ..on(&queue, &["gate"])
+            },
+        )
+        .step_with_options(
+            "cheap",
+            "cheap",
+            StepOptions {
+                when: Some(StepCondition {
+                    all: Some(Some(vec![
+                        leaf("gate.score", ConditionOp::Lte, json!(0.8)),
+                        StepCondition {
+                            path: Some(Some("gate.score".to_owned())),
+                            ..StepCondition::new()
+                        },
+                    ])),
+                    ..StepCondition::new()
+                }),
+                ..on(&queue, &["gate"])
+            },
+        )
+        .step_with_options("finish", "finish", on(&queue, &["review", "cheap"]));
+
+    let reviewed = Arc::new(AtomicUsize::new(0));
+    let handlers = Handlers::new()
+        .register("score", |_ctx| async move { Ok(obj(json!({"score": 0.1}))) })
+        .register("review", {
+            let reviewed = reviewed.clone();
+            move |_ctx| {
+                reviewed.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(obj(json!({"reviewed": true}))) }
+            }
+        })
+        .register("cheap", |_ctx| async move { Ok(obj(json!({"cheap": true}))) })
+        .register("finish", |ctx| async move {
+            let context = context_of(&ctx.job.payload);
+            let mut keys: Vec<String> = context
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            keys.sort();
+            Ok(obj(json!({"context_keys": keys})))
+        });
+
+    let id = qf.create_workflow(&dag).await.expect("create_workflow");
+    let finished = with_worker(&qf, &queue, handlers, qf.wait_for_workflow(&id, WAIT))
+        .await
+        .expect("wait_for_workflow");
+    assert_eq!(
+        finished.status,
+        WorkflowStatus::Completed,
+        "error: {:?}",
+        finished.error_message
+    );
+    assert_eq!(reviewed.load(Ordering::SeqCst), 0, "review must not have run");
+
+    let states = qf.workflow_steps(&id).await.expect("workflow_steps");
+    let review = state(&states, "review");
+    assert_eq!(review.status, StepStatus::Skipped);
+    assert_eq!(review.error, Some(Some("condition not met".to_owned())));
+    assert_eq!(review.job_id.clone().flatten(), None);
+    assert!(review.completed_at.clone().flatten().is_some(), "{:?}", review);
+    assert_eq!(state(&states, "cheap").status, StepStatus::Completed);
+    let finish = state(&states, "finish");
+    assert_eq!(finish.status, StepStatus::Completed);
+    assert!(finish.started_at.clone().flatten().is_some(), "{:?}", finish);
+
+    // The dependent saw gate and cheap, but no result for the skipped step.
+    let context = finished.context.expect("context");
+    assert_eq!(
+        context["finish"]["context_keys"],
+        json!(["cheap", "gate"]),
+        "{:?}",
+        context
+    );
+    assert!(!context.contains_key("review"), "{:?}", context);
+}
+
+/// A fan-out runs one child per array element, each on the step's queue with
+/// the element under `item_key`, and settles with ordered results and
+/// `{total, completed, failed}` counts.
+#[tokio::test]
+async fn live_fan_out_runs_one_child_per_item_and_collects_ordered_results() {
+    let Some(qf) = live_client() else { return };
+    let queue = run_queue();
+    let double_task = format!("rust-live-double-{}", suffix());
+
+    let dag = WorkflowBuilder::new(&format!("rust-live-fanout-{}", suffix()))
+        .step_with_options("load", "load", on(&queue, &[]))
+        .step_with_options(
+            "double",
+            &double_task,
+            StepOptions {
+                fan_out: Some(FanOut {
+                    item_key: Some(Some("n".to_owned())),
+                    max_items: Some(Some(10)),
+                    path: "load.items".to_owned(),
+                }),
+                ..on(&queue, &["load"])
+            },
+        )
+        .step_with_options("sum", "sum", on(&queue, &["double"]));
+
+    let handlers = Handlers::new()
+        .register("load", |_ctx| async move { Ok(obj(json!({"items": [1, 2, 3]}))) })
+        .register(&double_task, |ctx| async move {
+            let payload = ctx.job.payload.clone().unwrap_or_default();
+            let n = payload["n"].as_i64().ok_or_else(|| {
+                HandlerError::non_retryable(format!("no item under n: {:?}", payload))
+            })?;
+            let index = payload["_index"].as_i64().unwrap_or(-1);
+            Ok(obj(json!({"doubled": n * 2, "index": index})))
+        })
+        .register("sum", |ctx| async move {
+            let context = context_of(&ctx.job.payload);
+            let total: i64 = context["double"]["results"]
+                .as_array()
+                .map(|rs| rs.iter().filter_map(|r| r["doubled"].as_i64()).sum())
+                .unwrap_or(-1);
+            Ok(obj(json!({"total": total})))
+        });
+
+    let id = qf.create_workflow(&dag).await.expect("create_workflow");
+    let finished = with_worker(&qf, &queue, handlers, qf.wait_for_workflow(&id, WAIT))
+        .await
+        .expect("wait_for_workflow");
+    assert_eq!(
+        finished.status,
+        WorkflowStatus::Completed,
+        "error: {:?}",
+        finished.error_message
+    );
+
+    let context = finished.context.expect("context");
+    assert_eq!(
+        context["double"]["results"],
+        json!([
+            {"doubled": 2, "index": 0},
+            {"doubled": 4, "index": 1},
+            {"doubled": 6, "index": 2}
+        ]),
+        "{:?}",
+        context
+    );
+    assert_eq!(context["sum"]["total"], json!(12));
+
+    let states = qf.workflow_steps(&id).await.expect("workflow_steps");
+    let double = state(&states, "double");
+    assert_eq!(double.status, StepStatus::Completed);
+    let progress = double.fan_out.clone().flatten().expect("fan_out progress");
+    assert_eq!((progress.total, progress.completed, progress.failed), (3, 3, 0));
+    let first_child = double.job_id.clone().flatten().expect("job_id of the first child");
+    assert_eq!(state(&states, "sum").fan_out, None);
+
+    // The children are ordinary jobs on the step's queue carrying their
+    // position in the fan-out.
+    let children = qf
+        .list_jobs(&ListOptions {
+            queue: Some(queue.clone()),
+            task_name: Some(double_task.clone()),
+            limit: Some(10),
+            ..ListOptions::default()
+        })
+        .await
+        .expect("list_jobs");
+    assert_eq!(children.jobs.len(), 3, "{:?}", children.jobs);
+    assert!(children.jobs.iter().any(|j| j.id == first_child));
+    for job in &children.jobs {
+        assert_eq!(job.status, JobStatus::Completed);
+        assert_eq!(job.workflow_id, Some(Some(id.clone())));
+        let metadata = job.metadata.clone().unwrap_or_default();
+        assert_eq!(metadata.get("fan_out_total"), Some(&json!(3)), "{:?}", metadata);
+        assert!(metadata.contains_key("fan_out_index"), "{:?}", metadata);
+    }
+}
+
+/// A sub-workflow step spawns a child workflow linked to its parent; the
+/// child sees the step payload and the parent context under `_parent`, and
+/// its final context becomes the step's result.
+#[tokio::test]
+async fn live_sub_workflow_runs_as_a_linked_child() {
+    let Some(qf) = live_client() else { return };
+    let queue = run_queue();
+
+    let child = WorkflowBuilder::new("fulfilment")
+        .step_with_options("x", "emit", on(&queue, &[]))
+        .step_with_options("y", "grab", on(&queue, &["x"]))
+        .timeout_secs(600)
+        .build()
+        .expect("child build");
+    let dag = WorkflowBuilder::new(&format!("rust-live-sub-{}", suffix()))
+        .step_with_options("prep", "emit", on(&queue, &[]))
+        .sub_workflow(
+            "sub",
+            child,
+            StepOptions {
+                payload: Some(obj(json!({"mode": "fast"}))),
+                ..on(&queue, &["prep"])
+            },
+        )
+        .step_with_options("after", "grab", on(&queue, &["sub"]));
+
+    let handlers = Handlers::new()
+        .register("emit", |_ctx| async move { Ok(obj(json!({"value": 42}))) })
+        .register("grab", |ctx| async move {
+            Ok(obj(json!({"seen": context_of(&ctx.job.payload)})))
+        });
+
+    let id = qf.create_workflow(&dag).await.expect("create_workflow");
+    let finished = with_worker(&qf, &queue, handlers, qf.wait_for_workflow(&id, WAIT))
+        .await
+        .expect("wait_for_workflow");
+    assert_eq!(
+        finished.status,
+        WorkflowStatus::Completed,
+        "error: {:?}",
+        finished.error_message
+    );
+    assert_eq!(finished.parent_workflow_id.clone().flatten(), None);
+
+    let states = qf.workflow_steps(&id).await.expect("workflow_steps");
+    let sub = state(&states, "sub");
+    assert_eq!(sub.status, StepStatus::Completed);
+    assert_eq!(sub.job_id.clone().flatten(), None, "a sub-workflow step has no job");
+    let child_id = sub.child_workflow_id.clone().flatten().expect("child_workflow_id");
+
+    let child = qf.get_workflow(&child_id).await.expect("get_workflow (child)");
+    assert_eq!(child.status, WorkflowStatus::Completed);
+    assert_eq!(child.name, "fulfilment");
+    assert_eq!(child.parent_workflow_id, Some(Some(id.clone())));
+    assert_eq!(child.parent_step_name, Some(Some("sub".to_owned())));
+    assert_eq!(child.timeout_secs, Some(Some(600)));
+    assert!(child.deadline_at.clone().flatten().is_some(), "{:?}", child);
+    let child_context = child.context.clone().expect("child context");
+    assert_eq!(child_context["mode"], json!("fast"));
+    assert_eq!(child_context["_parent"]["prep"]["value"], json!(42));
+    // The child's own step saw the child context, parent results included.
+    assert_eq!(child_context["y"]["seen"]["x"]["value"], json!(42));
+    assert_eq!(child_context["y"]["seen"]["_parent"]["prep"]["value"], json!(42));
+
+    // The step result is the child's final context; the dependent saw it.
+    let context = finished.context.expect("context");
+    assert_eq!(context["sub"]["x"]["value"], json!(42));
+    assert_eq!(context["sub"]["mode"], json!("fast"));
+    assert_eq!(context["after"]["seen"]["sub"]["x"]["value"], json!(42));
+
+    // The child lists like any other workflow.
+    let listed = qf
+        .list_workflows(&ListOptions {
+            status: Some("completed".to_owned()),
+            limit: Some(100),
+            order_by: Some("created_at DESC".to_owned()),
+            ..ListOptions::default()
+        })
+        .await
+        .expect("list_workflows");
+    assert!(
+        listed.workflows.iter().any(|w| w.id == child_id),
+        "child {} missing from the list",
+        child_id
+    );
+}
+
+/// A non-retryable failure under `halt` fails the workflow and cancels the
+/// rest; once the cause is fixed, `retry_workflow` re-runs only the
+/// unfinished steps, clears the error and bumps `retry_count`. Retrying a
+/// completed workflow is a 409.
+#[tokio::test]
+async fn live_retry_reruns_the_unfinished_steps_after_a_failure() {
+    let Some(qf) = live_client() else { return };
+    let queue = run_queue();
+
+    let dag = WorkflowBuilder::new(&format!("rust-live-retry-{}", suffix()))
+        .step_with_options("a", "ok", on(&queue, &[]))
+        .step_with_options("b", "flaky", on(&queue, &["a"]))
+        .step_with_options("c", "ok", on(&queue, &["b"]))
+        .timeout_secs(600);
+
+    let ok_runs = Arc::new(AtomicUsize::new(0));
+    let flaky_runs = Arc::new(AtomicUsize::new(0));
+    let handlers = Handlers::new()
+        .register("ok", {
+            let ok_runs = ok_runs.clone();
+            move |_ctx| {
+                ok_runs.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(obj(json!({"ok": true}))) }
+            }
+        })
+        .register("flaky", {
+            let flaky_runs = flaky_runs.clone();
+            move |_ctx| {
+                let run = flaky_runs.fetch_add(1, Ordering::SeqCst);
+                async move {
+                    if run == 0 {
+                        Err(HandlerError::non_retryable("first run fails"))
+                    } else {
+                        Ok(obj(json!({"ran": run + 1})))
+                    }
+                }
+            }
+        });
+
+    let id = qf.create_workflow(&dag).await.expect("create_workflow");
+    let (failed, retried) = with_worker(&qf, &queue, handlers, async {
+        let failed = qf.wait_for_workflow(&id, WAIT).await.expect("wait_for_workflow");
+        qf.retry_workflow(&id).await.expect("retry_workflow");
+        let retried = qf
+            .wait_for_workflow(&id, WAIT)
+            .await
+            .expect("wait_for_workflow (retry)");
+        (failed, retried)
+    })
+    .await;
+
+    assert_eq!(failed.status, WorkflowStatus::Failed, "{:?}", failed);
+    let error = failed.error_message.clone().flatten().expect("error_message");
+    assert!(error.contains("first run fails"), "{}", error);
+    assert_eq!(failed.retry_count.unwrap_or(0), 0);
+    assert_eq!(failed.timeout_secs, Some(Some(600)));
+    let first_deadline = failed.deadline_at.clone().flatten().expect("deadline_at");
+
+    assert_eq!(
+        retried.status,
+        WorkflowStatus::Completed,
+        "error: {:?}",
+        retried.error_message
+    );
+    assert_eq!(retried.error_message.clone().flatten(), None);
+    assert_eq!(retried.retry_count, Some(1));
+    assert!(
+        retried.deadline_at.clone().flatten().is_some_and(|d| d >= first_deadline),
+        "deadline not re-armed: {:?} -> {:?}",
+        first_deadline,
+        retried.deadline_at
+    );
+    let context = retried.context.expect("context");
+    assert_eq!(context["b"]["ran"], json!(2));
+    assert_eq!(context["c"]["ok"], json!(true));
+    // a kept its result and did not run again; b ran twice; c ran once.
+    assert_eq!(flaky_runs.load(Ordering::SeqCst), 2);
+    assert_eq!(ok_runs.load(Ordering::SeqCst), 2, "a once, c once");
+
+    let states = qf.workflow_steps(&id).await.expect("workflow_steps");
+    for name in ["a", "b", "c"] {
+        let step = state(&states, name);
+        assert_eq!(step.status, StepStatus::Completed, "{:?}", step);
+        assert_eq!(step.error.clone().flatten(), None, "{:?}", step);
+    }
+
+    match qf.retry_workflow(&id).await {
+        Err(err) if err.status() == Some(409) => {}
+        other => panic!("retry of a completed workflow: {:?}, want 409", other),
     }
 }

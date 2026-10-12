@@ -10,6 +10,8 @@ Method | HTTP request | Description
 [**get_workflow_diagram**](WorkflowsApi.md#get_workflow_diagram) | **GET** /api/v1/workflows/{id}/diagram | 
 [**get_workflow_step_states**](WorkflowsApi.md#get_workflow_step_states) | **GET** /api/v1/workflows/{id}/steps | 
 [**list_workflows**](WorkflowsApi.md#list_workflows) | **GET** /api/v1/workflows | 
+[**retry_workflow**](WorkflowsApi.md#retry_workflow) | **POST** /api/v1/workflows/{id}/retry | 
+[**stream_workflow_events**](WorkflowsApi.md#stream_workflow_events) | **GET** /api/v1/workflows/{id}/events | Stream a workflow's progress as Server-Sent Events: one `status` event whenever the workflow or any step changes, until the workflow is terminal.
 
 
 
@@ -187,6 +189,62 @@ Name | Type | Description  | Required | Notes
 
 - **Content-Type**: Not defined
 - **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## retry_workflow
+
+> retry_workflow(id)
+
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**id** | **String** | Workflow id | [required] |
+
+### Return type
+
+ (empty response body)
+
+### Authorization
+
+[bearerAuth](../README.md#bearerAuth)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: application/json
+
+[[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
+
+
+## stream_workflow_events
+
+> models::WorkflowEvent stream_workflow_events(id)
+Stream a workflow's progress as Server-Sent Events: one `status` event whenever the workflow or any step changes, until the workflow is terminal.
+
+### Parameters
+
+
+Name | Type | Description  | Required | Notes
+------------- | ------------- | ------------- | ------------- | -------------
+**id** | **String** | Workflow id | [required] |
+
+### Return type
+
+[**models::WorkflowEvent**](WorkflowEvent.md)
+
+### Authorization
+
+[bearerAuth](../README.md#bearerAuth)
+
+### HTTP request headers
+
+- **Content-Type**: Not defined
+- **Accept**: text/event-stream, application/json
 
 [[Back to top]](#) [[Back to API list]](../README.md#documentation-for-api-endpoints) [[Back to Model list]](../README.md#documentation-for-models) [[Back to README]](../README.md)
 

@@ -5,7 +5,8 @@ workflow engine.
 
 - **Typed end-to-end**: request/response models mirror the server's OpenAPI 3.1 spec.
 - **Ergonomic**: one method per endpoint on `QueueFlow`, `wait_for_job`/`wait_for_workflow`
-  pollers, and a workflow builder with local DAG validation.
+  pollers, and a workflow builder with local DAG validation: steps, per-step queues, `when`
+  conditions, fan-out, inline sub-workflows and a whole-workflow deadline.
 - **Worker runtime**: `run_worker` leases jobs, runs your async handlers concurrently, heartbeats
   them, and reports outcomes, with the server's retry policy and dead-letter queue doing the rest.
 - **Typed errors**: every non-2xx response is a `FacadeError::Http` carrying the status and body.
@@ -19,7 +20,7 @@ The crate is `queueflow-sdk`; the bare `queueflow` crate name belongs to the ser
 
 ```toml
 [dependencies]
-queueflow-sdk = "0.4"
+queueflow-sdk = "0.5"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 serde_json = "1"
 ```
@@ -132,10 +133,24 @@ println!("cancelled {} pending billing jobs", n);
 | Method | Description |
 | --- | --- |
 | `create_workflow(&WorkflowBuilder) -> String` | Validate the DAG locally, create it, return the workflow id. |
-| `get_workflow(id)` / `list_workflows(&ListOptions)` / `cancel_workflow(id)` | Fetch / list / cancel. |
+| `get_workflow(id)` / `list_workflows(&ListOptions)` / `cancel_workflow(id)` | Fetch / list / cancel (cancelling also cancels fan-out children and child workflows). |
+| `retry_workflow(id)` | Re-run a `failed`, `partially_failed` or `cancelled` workflow from where it stopped; a running or completed one is a 409. |
 | `workflow_diagram(id) -> models::WorkflowDiagramResponse` | Mermaid (`graph TD`) diagram of the DAG. |
-| `workflow_steps(id) -> Vec<models::WorkflowStepState>` | Runtime status of every step, with the job id executing it. |
+| `workflow_steps(id) -> Vec<models::WorkflowStepState>` | Live state of every step in declaration order: `status`, `job_id`, `error`, `started_at`, `completed_at`, `child_workflow_id`, `fan_out` counts. |
 | `wait_for_workflow(id, WaitOptions) -> models::Workflow` | Poll until a terminal workflow state. |
+
+The `models::Workflow` record carries the step definitions, the accumulated `context` (step
+results keyed by step name), `error_message`, `timeout_secs` and `deadline_at`, `retry_count`,
+and `parent_workflow_id` / `parent_step_name` on a child spawned by a sub-workflow step. The
+`models::WorkflowStepState` entries from `workflow_steps` carry the `error` behind a failed,
+skipped (`condition not met`) or cancelled step, the `fan_out` `{total, completed, failed}`
+counts of a fan-out step and the `child_workflow_id` of a sub-workflow step.
+
+`retry_workflow` puts every step that did not complete (failed, cancelled, or skipped by a
+failure policy) back to pending and schedules it again as its dependencies allow; completed and
+condition-skipped steps keep their results. The workflow becomes `running`, `error_message`
+clears, `retry_count` increments and the deadline, if any, is re-armed from `timeout_secs`. Fix
+the cause first: a retry with the same inputs fails the same way.
 
 ### Workflow builder
 
@@ -158,8 +173,67 @@ let body = dag.build()?; // duplicate names, dangling deps and cycles fail here,
 ```
 
 `step(name, task, after)` adds a step gated on the named `after` steps; `step_with_options` adds
-`payload`, `config`, `on_failure`, `on_success` and `metadata`. `context` and `metadata` seed the
-workflow-level fields. `create_workflow` calls `build()` for you.
+`payload`, `config`, `queue`, `on_failure`, `on_success`, `when`, `fan_out` and `metadata`.
+`context` and `metadata` seed the workflow-level fields; `timeout_secs` sets the whole-workflow
+deadline (1 second to 30 days). `create_workflow` calls `build()` for you.
+
+Conditions, fan-out and sub-workflows (server 0.6.0 and later) use the generated models directly:
+
+```rust
+use queueflow_sdk::models::{ConditionOp, FanOut, StepCondition};
+use queueflow_sdk::{StepOptions, WorkflowBuilder};
+
+fn on(after: &[&str]) -> StepOptions {
+    StepOptions {
+        after: after.iter().map(|s| s.to_string()).collect(),
+        queue: Some("orders".to_owned()), // every step's job(s) run on this queue
+        ..StepOptions::default()
+    }
+}
+
+let fulfilment = WorkflowBuilder::new("fulfilment")
+    .step_with_options("pick", "pick_items", on(&[]))
+    .step_with_options("pack", "pack_parcel", on(&["pick"]))
+    .timeout_secs(1800)
+    .build()?;
+
+let dag = WorkflowBuilder::new("order_123")
+    .step_with_options("fetch", "fetch_order", on(&[]))
+    // Runs only when fetch.score > 0.8; otherwise skipped with `condition not
+    // met`, and its dependents still run (without a result for it).
+    .step_with_options("review", "queue_for_review", StepOptions {
+        when: Some(StepCondition {
+            path: Some(Some("fetch.score".to_owned())),
+            op: Some(Some(ConditionOp::Gt)),
+            value: Some(Some(serde_json::json!(0.8))),
+            ..StepCondition::new()
+        }),
+        ..on(&["fetch"])
+    })
+    // One child job per element of fetch.images, each with the element under
+    // `image`; the step result is {"results": [...]} in element order.
+    .step_with_options("resize", "resize_image", StepOptions {
+        fan_out: Some(FanOut {
+            item_key: Some(Some("image".to_owned())),
+            ..FanOut::new("fetch.images".to_owned())
+        }),
+        ..on(&["fetch"])
+    })
+    // An inline child workflow; its final context becomes the step result.
+    .sub_workflow("fulfil", fulfilment, on(&["review", "resize"]))
+    .timeout_secs(3600);
+```
+
+A `StepCondition` is a leaf (`path`, optional `op`, `value`) or one of `all`, `any`, `not`. The
+operators are `eq` (the default with a `value`), `ne`, `gt`, `gte`, `lt`, `lte`, `exists` (the
+default without one), `contains` and `in`; a missing path never errors, it compares as absent.
+`sub_workflow(name, child, opts)` takes the `models::CreateWorkflowRequest` another builder's
+`build()` produced; `opts.payload` is merged into the child's context and the parent's context is
+available to it under `_parent`. `build()` runs the server's structural checks locally
+(duplicate names, dangling deps, cycles, a step with neither task nor workflow or with both a
+fan-out and a workflow, condition shape and operator/value consistency, fan-out limits, the
+timeout range and the 8-level nesting limit), recursively through sub-workflows, and returns
+`FacadeError::InvalidWorkflow` before any request.
 
 ### Worker
 
@@ -326,11 +400,13 @@ itself, which is what makes that blanket conversion possible.
 Generated functions return `apis::Error<OperationError>` directly; its `ResponseError` variant
 carries the HTTP `status`, raw `content`, and the decoded error `entity`.
 
-## Known limitation: `stream_job_events`
+## Known limitation: `stream_job_events` and `stream_workflow_events`
 
-The generated `jobs_api::stream_job_events` cannot consume the server's SSE stream: it buffers the
-whole response until the stream closes and then fails to decode it. Use `wait_for_job` (polling)
-instead, or a hand-rolled SSE consumer over `GET /api/v1/jobs/{id}/events`.
+The generated `jobs_api::stream_job_events` and `workflows_api::stream_workflow_events` cannot
+consume the server's SSE streams: each buffers the whole response until the stream closes and
+then fails to decode it. Use `wait_for_job` / `wait_for_workflow` (polling) instead, or a
+hand-rolled SSE consumer over `GET /api/v1/jobs/{id}/events` or
+`GET /api/v1/workflows/{id}/events`.
 
 ## Conformance tests
 
@@ -341,7 +417,10 @@ workflow, exercises the cron, dead-letter, queue backlog, stats and `whoami` end
 `run_worker` against a dedicated queue: one scenario completes a job with a handler only the test
 knows, another dead-letters a job with `HandlerError::non_retryable` and replays it. Bulk cancel,
 bulk replay and pause/resume each run against a queue named for that run alone, so the suite is
-safe on a shared server. The tests skip themselves unless `QUEUEFLOW_URL` is set, so plain
+safe on a shared server. Four workflow scenarios (server 0.6.0 and later) put every step on a
+`rust-live-<uuid>` queue served by the test's own worker: a condition-skipped step whose
+dependent still runs, a fan-out with ordered results and `fan_out` counts, a sub-workflow child
+linked to its parent, and a retry after a non-retryable failure. The tests skip themselves unless `QUEUEFLOW_URL` is set, so plain
 `cargo test` and CI stay offline.
 
 ```bash

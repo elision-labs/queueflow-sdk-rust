@@ -4,6 +4,7 @@ docs/BackoffStrategy.md
 docs/CancelJobsRequest.md
 docs/CancelJobsResponse.md
 docs/CompleteJobRequest.md
+docs/ConditionOp.md
 docs/CreateBatchJobsRequest.md
 docs/CreateBatchJobsResponse.md
 docs/CreateCronRequest.md
@@ -18,6 +19,8 @@ docs/DeadLetter.md
 docs/DlqApi.md
 docs/ErrorBody.md
 docs/FailJobRequest.md
+docs/FanOut.md
+docs/FanOutProgress.md
 docs/HealthApi.md
 docs/HealthStatus.md
 docs/HeartbeatRequest.md
@@ -45,6 +48,7 @@ docs/ReplayDeadLettersRequest.md
 docs/ReplayDeadLettersResponse.md
 docs/ReplayedDeadLetter.md
 docs/StatsSnapshot.md
+docs/StepCondition.md
 docs/StepStatus.md
 docs/SystemApi.md
 docs/TasksResponse.md
@@ -52,6 +56,7 @@ docs/WhoAmIResponse.md
 docs/WorkerApi.md
 docs/Workflow.md
 docs/WorkflowDiagramResponse.md
+docs/WorkflowEvent.md
 docs/WorkflowStatus.md
 docs/WorkflowStep.md
 docs/WorkflowStepState.md
@@ -72,6 +77,7 @@ src/models/backoff_strategy.rs
 src/models/cancel_jobs_request.rs
 src/models/cancel_jobs_response.rs
 src/models/complete_job_request.rs
+src/models/condition_op.rs
 src/models/create_batch_jobs_request.rs
 src/models/create_batch_jobs_response.rs
 src/models/create_cron_request.rs
@@ -84,6 +90,8 @@ src/models/cron_schedule.rs
 src/models/dead_letter.rs
 src/models/error_body.rs
 src/models/fail_job_request.rs
+src/models/fan_out.rs
+src/models/fan_out_progress.rs
 src/models/health_status.rs
 src/models/heartbeat_request.rs
 src/models/heartbeat_response.rs
@@ -110,11 +118,13 @@ src/models/replay_dead_letters_request.rs
 src/models/replay_dead_letters_response.rs
 src/models/replayed_dead_letter.rs
 src/models/stats_snapshot.rs
+src/models/step_condition.rs
 src/models/step_status.rs
 src/models/tasks_response.rs
 src/models/who_am_i_response.rs
 src/models/workflow.rs
 src/models/workflow_diagram_response.rs
+src/models/workflow_event.rs
 src/models/workflow_status.rs
 src/models/workflow_step.rs
 src/models/workflow_step_state.rs

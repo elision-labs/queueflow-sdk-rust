@@ -16,7 +16,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use queueflow_sdk::models::{BackoffStrategy, JobConfig, JobStatus, OnFailure, OnSuccess};
+use queueflow_sdk::models::{
+    BackoffStrategy, ConditionOp, FanOut, JobConfig, JobStatus, OnFailure, OnSuccess,
+    StepCondition, StepStatus, WorkflowStatus,
+};
 use queueflow_sdk::{
     CancelJobsFilter, CreateCronOptions, CreateJobOptions, FacadeError, HandlerError, Handlers,
     Json, LeaseOptions, ListOptions, QueueFlow, QueueFlowOptions, ReplayDeadLettersFilter,
@@ -171,7 +174,7 @@ fn workflow_builder_step_options_and_context_reach_the_wire_shape() {
                 on_failure: Some(OnFailure::Continue),
                 on_success: Some(OnSuccess::Continue),
                 metadata: Some(obj(json!({"owner": "data"}))),
-                payload: None,
+                ..StepOptions::default()
             },
         )
         .context(obj(json!({"a": 1})))
@@ -190,6 +193,224 @@ fn workflow_builder_step_options_and_context_reach_the_wire_shape() {
     assert_eq!(steps[1]["depends_on"], json!(["extract"]));
     assert_eq!(wire["context"], json!({"a": 1, "b": 2}));
     assert_eq!(wire["metadata"], json!({"source": "test"}));
+}
+
+
+/// A leaf condition in the generated model's shape.
+fn leaf(path: &str, op: Option<ConditionOp>, value: Option<Value>) -> StepCondition {
+    StepCondition {
+        path: Some(Some(path.to_owned())),
+        op: op.map(Some),
+        value: value.map(Some),
+        ..StepCondition::new()
+    }
+}
+
+#[test]
+fn workflow_builder_v2_step_fields_reach_the_wire_shape() {
+    let child = WorkflowBuilder::new("fulfilment")
+        .step("pick", "pick_items", &[])
+        .step("pack", "pack_parcel", &["pick"])
+        .timeout_secs(1800)
+        .build()
+        .expect("child build");
+    let body = WorkflowBuilder::new("order")
+        .step_with_options(
+            "validate",
+            "validate_order",
+            StepOptions {
+                queue: Some("orders".to_owned()),
+                ..StepOptions::default()
+            },
+        )
+        .step_with_options(
+            "review",
+            "queue_for_review",
+            StepOptions {
+                after: vec!["validate".to_owned()],
+                when: Some(StepCondition {
+                    any: Some(Some(vec![
+                        leaf("validate.score", Some(ConditionOp::Gt), Some(json!(0.8))),
+                        StepCondition {
+                            not: Some(Some(Box::new(leaf(
+                                "validate.trusted",
+                                None,
+                                Some(json!(true)),
+                            )))),
+                            ..StepCondition::new()
+                        },
+                    ])),
+                    ..StepCondition::new()
+                }),
+                ..StepOptions::default()
+            },
+        )
+        .step_with_options(
+            "resize",
+            "resize_image",
+            StepOptions {
+                after: vec!["validate".to_owned()],
+                fan_out: Some(FanOut {
+                    item_key: Some(Some("image".to_owned())),
+                    max_items: Some(Some(50)),
+                    path: "validate.images".to_owned(),
+                }),
+                on_failure: Some(OnFailure::Continue),
+                ..StepOptions::default()
+            },
+        )
+        .sub_workflow(
+            "fulfil",
+            child,
+            StepOptions {
+                after: vec!["review".to_owned(), "resize".to_owned()],
+                payload: Some(obj(json!({"warehouse": "eu-1"}))),
+                ..StepOptions::default()
+            },
+        )
+        .timeout_secs(3600)
+        .build()
+        .expect("build");
+    let wire = serde_json::to_value(&body).unwrap();
+    assert_eq!(wire["timeout_secs"], 3600);
+    let steps = wire["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 4);
+
+    assert_eq!(steps[0]["task_name"], "validate_order");
+    assert_eq!(steps[0]["queue"], "orders");
+    for key in ["when", "fan_out", "workflow"] {
+        assert!(steps[0].get(key).is_none(), "unset {} must be omitted", key);
+    }
+    assert!(steps[1].get("queue").is_none(), "unset queue must be omitted");
+
+    assert_eq!(
+        steps[1]["when"],
+        json!({"any": [
+            {"path": "validate.score", "op": "gt", "value": 0.8},
+            {"not": {"path": "validate.trusted", "value": true}}
+        ]})
+    );
+
+    assert_eq!(
+        steps[2]["fan_out"],
+        json!({"path": "validate.images", "item_key": "image", "max_items": 50})
+    );
+    assert_eq!(steps[2]["on_failure"], "continue");
+
+    assert!(
+        steps[3].get("task_name").is_none(),
+        "a sub-workflow step carries no task_name"
+    );
+    assert_eq!(steps[3]["depends_on"], json!(["review", "resize"]));
+    assert_eq!(steps[3]["payload"], json!({"warehouse": "eu-1"}));
+    assert_eq!(steps[3]["workflow"]["name"], "fulfilment");
+    assert_eq!(steps[3]["workflow"]["timeout_secs"], 1800);
+    assert_eq!(steps[3]["workflow"]["steps"][1]["depends_on"], json!(["pick"]));
+}
+
+#[test]
+fn workflow_builder_rejects_invalid_v2_definitions_before_any_round_trip() {
+    let err = |b: &WorkflowBuilder| match b.build() {
+        Err(FacadeError::InvalidWorkflow(msg)) => msg,
+        other => panic!("expected InvalidWorkflow, got {:?}", other.map(|_| "Ok")),
+    };
+    let gated = |cond: StepCondition| {
+        WorkflowBuilder::new("w").step_with_options(
+            "a",
+            "t",
+            StepOptions {
+                when: Some(cond),
+                ..StepOptions::default()
+            },
+        )
+    };
+
+    assert!(err(&WorkflowBuilder::new("w").step("a", "t", &[]).timeout_secs(0))
+        .contains("timeout_secs must be within 1..=2592000"));
+    assert!(
+        err(&WorkflowBuilder::new("w").step("a", "t", &[]).timeout_secs(2_592_001))
+            .contains("timeout_secs"),
+    );
+
+    // Conditions: shape and operator/value consistency.
+    let msg = err(&gated(leaf("x", Some(ConditionOp::Gt), None)));
+    assert!(msg.contains("step \"a\": when: op gt needs a value"), "{}", msg);
+    assert!(err(&gated(leaf("x", Some(ConditionOp::Exists), Some(json!(1)))))
+        .contains("op exists does not take a value"));
+    assert!(err(&gated(leaf("x", Some(ConditionOp::In), Some(json!("not-an-array")))))
+        .contains("op in needs an array value"));
+    assert!(err(&gated(leaf("", None, Some(json!(1))))).contains("path must not be empty"));
+    assert!(err(&gated(StepCondition::new())).contains("exactly one of path, all, any or not"));
+    assert!(err(&gated(StepCondition {
+        all: Some(Some(vec![])),
+        ..StepCondition::new()
+    }))
+    .contains("at least one member"));
+    assert!(err(&gated(StepCondition {
+        all: Some(Some(vec![leaf("x", None, None)])),
+        op: Some(Some(ConditionOp::Eq)),
+        ..StepCondition::new()
+    }))
+    .contains("op and value are only valid with path"));
+    // A nested member is validated too.
+    assert!(err(&gated(StepCondition {
+        not: Some(Some(Box::new(leaf("x", Some(ConditionOp::Lt), None)))),
+        ..StepCondition::new()
+    }))
+    .contains("op lt needs a value"));
+    // Defaults: a value alone means eq, no value means exists.
+    gated(leaf("x", None, Some(json!(1)))).build().expect("eq by default");
+    gated(leaf("x", None, None)).build().expect("exists by default");
+
+    // Fan-out.
+    let fan = |f: FanOut| {
+        WorkflowBuilder::new("w").step_with_options(
+            "a",
+            "t",
+            StepOptions {
+                fan_out: Some(f),
+                ..StepOptions::default()
+            },
+        )
+    };
+    assert!(err(&fan(FanOut::new(" ".to_owned()))).contains("fan_out.path is required"));
+    assert!(err(&fan(FanOut {
+        max_items: Some(Some(0)),
+        ..FanOut::new("items".to_owned())
+    }))
+    .contains("fan_out.max_items must be within 1..=10000"));
+    assert!(err(&fan(FanOut {
+        item_key: Some(Some("_context".to_owned())),
+        ..FanOut::new("items".to_owned())
+    }))
+    .contains("fan_out.item_key"));
+
+    // Sub-workflows: not combinable with a fan-out, validated recursively,
+    // and bounded in depth.
+    let child = WorkflowBuilder::new("c").step("x", "t", &[]).build().unwrap();
+    let both = WorkflowBuilder::new("w").sub_workflow(
+        "s",
+        child.clone(),
+        StepOptions {
+            fan_out: Some(FanOut::new("items".to_owned())),
+            ..StepOptions::default()
+        },
+    );
+    assert!(err(&both).contains("either a sub-workflow or a fan-out"));
+    let mut bad_child = child.clone();
+    bad_child.steps[0].depends_on = Some(vec!["x".to_owned()]);
+    let msg = err(&WorkflowBuilder::new("w").sub_workflow("s", bad_child, StepOptions::default()));
+    assert!(msg.contains("step \"s\": sub-workflow: dependency cycle"), "{}", msg);
+    let mut nested = child;
+    // Eight levels below the root are allowed; the ninth is not.
+    for level in 0..8 {
+        nested = WorkflowBuilder::new(&format!("level{}", level))
+            .sub_workflow("s", nested, StepOptions::default())
+            .build()
+            .expect("intermediate levels build on their own");
+    }
+    let too_deep = WorkflowBuilder::new("root").sub_workflow("s", nested, StepOptions::default());
+    assert!(err(&too_deep).contains("nest deeper than 8"));
 }
 
 // --- Client construction ---------------------------------------------------
@@ -683,7 +904,7 @@ async fn workflow_steps_unwraps_the_envelope() {
     let qf = QueueFlow::new(&server.uri(), "t");
     let steps = qf.workflow_steps("w1").await.expect("workflow_steps");
     assert_eq!(steps.len(), 2);
-    assert_eq!(steps[0].status, queueflow_sdk::models::StepStatus::Completed);
+    assert_eq!(steps[0].status, StepStatus::Completed);
     assert_eq!(steps[1].name, "b");
 }
 
@@ -706,8 +927,117 @@ async fn wait_for_workflow_treats_partially_failed_as_terminal() {
         .expect("partially_failed is terminal");
     assert_eq!(
         wf.status,
-        queueflow_sdk::models::WorkflowStatus::PartiallyFailed
+        WorkflowStatus::PartiallyFailed
     );
+}
+
+
+#[tokio::test]
+async fn retry_workflow_posts_to_the_retry_route_and_surfaces_409() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workflows/w1/retry"))
+        .and(header("authorization", "Bearer test-token"))
+        .respond_with(ResponseTemplate::new(204))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/v1/workflows/w2/retry"))
+        .respond_with(
+            ResponseTemplate::new(409)
+                .set_body_json(json!({"error": "workflow w2 is running; only failed, partially_failed or cancelled workflows can be retried"})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let qf = QueueFlow::new(&server.uri(), "test-token");
+    qf.retry_workflow("w1").await.expect("retry_workflow");
+    let err = qf.retry_workflow("w2").await.expect_err("running is a conflict");
+    match err {
+        FacadeError::Http { op, status, body } => {
+            assert_eq!(op, "retry_workflow");
+            assert_eq!(status, 409);
+            assert!(body.contains("only failed"), "{}", body);
+        }
+        other => panic!("want Http, got {:?}", other),
+    }
+    assert!(requests_to(&server, "/w1/retry").await[0].body.is_empty());
+}
+
+#[tokio::test]
+async fn workflow_steps_expose_errors_timings_children_and_fan_out_counts() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows/w1/steps"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"steps": [
+            {"name": "gate", "status": "skipped", "error": "condition not met",
+             "started_at": "2026-01-01T00:00:01Z", "completed_at": "2026-01-01T00:00:01Z"},
+            {"name": "resize", "status": "running", "job_id": "j1",
+             "started_at": "2026-01-01T00:00:02Z",
+             "fan_out": {"total": 3, "completed": 1, "failed": 0}},
+            {"name": "fulfil", "status": "completed", "child_workflow_id": "w2",
+             "started_at": "2026-01-01T00:00:03Z", "completed_at": "2026-01-01T00:00:09Z"},
+            {"name": "late", "status": "pending"}
+        ]})))
+        .mount(&server)
+        .await;
+    let qf = QueueFlow::new(&server.uri(), "t");
+    let steps = qf.workflow_steps("w1").await.expect("workflow_steps");
+    assert_eq!(steps.len(), 4);
+
+    assert_eq!(steps[0].status, StepStatus::Skipped);
+    assert_eq!(steps[0].error, Some(Some("condition not met".to_owned())));
+    assert_eq!(steps[0].completed_at, Some(Some("2026-01-01T00:00:01Z".to_owned())));
+    assert_eq!(steps[0].job_id, None);
+
+    let progress = steps[1].fan_out.clone().flatten().expect("fan_out progress");
+    assert_eq!((progress.total, progress.completed, progress.failed), (3, 1, 0));
+    assert_eq!(steps[1].job_id, Some(Some("j1".to_owned())));
+    assert_eq!(steps[1].completed_at, None);
+
+    assert_eq!(steps[2].child_workflow_id, Some(Some("w2".to_owned())));
+    assert_eq!(steps[2].fan_out, None);
+
+    assert_eq!(steps[3].started_at, None);
+    assert_eq!(steps[3].error, None);
+}
+
+#[tokio::test]
+async fn get_workflow_decodes_the_deadline_retry_and_parent_fields() {
+    let server = MockServer::start().await;
+    let mut record = workflow_json("w2", "failed");
+    for (k, v) in [
+        ("error_message", json!("step 'b': boom")),
+        ("timeout_secs", json!(3600)),
+        ("deadline_at", json!("2026-01-01T01:00:00Z")),
+        ("retry_count", json!(2)),
+        ("parent_workflow_id", json!("w1")),
+        ("parent_step_name", json!("fulfil")),
+    ] {
+        record[k] = v;
+    }
+    Mock::given(method("GET"))
+        .and(path("/api/v1/workflows/w2"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(record))
+        .mount(&server)
+        .await;
+    let qf = QueueFlow::new(&server.uri(), "t");
+    let wf = qf.get_workflow("w2").await.expect("get_workflow");
+    assert_eq!(wf.status, WorkflowStatus::Failed);
+    assert_eq!(wf.error_message, Some(Some("step 'b': boom".to_owned())));
+    assert_eq!(wf.timeout_secs, Some(Some(3600)));
+    assert_eq!(wf.deadline_at, Some(Some("2026-01-01T01:00:00Z".to_owned())));
+    assert_eq!(wf.retry_count, Some(2));
+    assert_eq!(wf.parent_workflow_id, Some(Some("w1".to_owned())));
+    assert_eq!(wf.parent_step_name, Some(Some("fulfil".to_owned())));
+
+    // A record without them decodes too (the pre-0.6 shape).
+    let bare: queueflow_sdk::models::Workflow =
+        serde_json::from_value(workflow_json("w1", "running")).unwrap();
+    assert_eq!(bare.retry_count, None);
+    assert_eq!(bare.error_message, None);
 }
 
 // --- Cron ------------------------------------------------------------------
